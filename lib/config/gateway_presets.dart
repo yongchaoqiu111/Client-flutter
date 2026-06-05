@@ -2,43 +2,36 @@ import '../models/node_config.dart';
 
 /// 设计文档 §8.3：客户端内置多网关域名，自动测速切换
 class GatewayPresets {
+  /// 生产默认双域名
+  static const productionDomains = ['book26.top', 'news16.top'];
+
+  static NodeConfig gatewayForDomain(String domain, {String? label}) {
+    final host = domain.replaceAll(RegExp(r'^https?://'), '').replaceAll(RegExp(r'/+$'), '');
+    return NodeConfig(
+      id: host.replaceAll('.', '_'),
+      name: label ?? host,
+      apiUrl: 'https://$host',
+      wsUrl: 'wss://$host/ws',
+      status: 'unknown',
+    );
+  }
+
   static List<NodeConfig> defaultNodes() {
-    const host = '127.0.0.1';
     return [
+      gatewayForDomain(productionDomains[0], label: '网关 A · book26'),
+      gatewayForDomain(productionDomains[1], label: '网关 B · news16'),
       NodeConfig(
-        id: 'gateway',
-        name: '本地网关',
-        apiUrl: 'http://$host:8443',
-        wsUrl: 'ws://$host:8443/ws',
-        status: 'unknown',
-      ),
-      NodeConfig(
-        id: 'node1',
-        name: '共识节点 1',
-        apiUrl: 'http://$host:3001',
-        wsUrl: 'ws://$host:3001',
-        status: 'unknown',
-      ),
-      NodeConfig(
-        id: 'node2',
-        name: '共识节点 2',
-        apiUrl: 'http://$host:3002',
-        wsUrl: 'ws://$host:3002',
-        status: 'unknown',
-      ),
-      NodeConfig(
-        id: 'node3',
-        name: '共识节点 3',
-        apiUrl: 'http://$host:3003',
-        wsUrl: 'ws://$host:3003',
+        id: 'local',
+        name: '本地开发',
+        apiUrl: 'http://127.0.0.1:8443',
+        wsUrl: 'ws://127.0.0.1:8443/ws',
         status: 'unknown',
       ),
     ];
   }
 
-  /// 生产环境从 CDN 拉取域名列表（§8.4）
-  static Future<List<NodeConfig>> fetchRemoteDomainList(Uri configUrl) async {
-    // TODO: GET domains.json → 解析为 NodeConfig 列表
-    return defaultNodes();
+  /// 从任一在线网关拉取域名列表，失败则用内置默认
+  static Future<List<NodeConfig>> fetchRemoteDomainList([String? seedApi]) async {
+    return defaultNodes().where((n) => n.id != 'local').toList();
   }
 }

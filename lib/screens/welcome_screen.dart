@@ -32,7 +32,7 @@ class WelcomeScreen extends StatelessWidget {
               ),
               const SizedBox(height: 12),
               OutlinedButton(
-                onPressed: () => context.go('/wallet-setup'),
+                onPressed: () => context.go('/wallet-setup?mode=import'),
                 child: const Text('导入钱包'),
               ),
             ],

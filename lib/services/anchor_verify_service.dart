@@ -1,8 +1,10 @@
 import 'dart:convert';
 
 import 'package:http/http.dart' as http;
+import 'package:http/io_client.dart';
 
 import '../models/node_config.dart';
+import 'gateway_http_client.dart';
 
 class AnchorStatus {
   AnchorStatus({
@@ -29,9 +31,11 @@ class AnchorStatus {
 
 /// 打币前校验：Raft 事件 Merkle 根（Polygon 多签上链为可选增强）
 class AnchorVerifyService {
+  static final http.Client _client = IOClient(GatewayHttpClient.shared());
+
   static Future<AnchorStatus> fetchStatus(NodeConfig node) async {
     final base = node.apiUrl.replaceAll(RegExp(r'/+$'), '');
-    final res = await http.get(Uri.parse('$base/api/anchor/status')).timeout(const Duration(seconds: 8));
+    final res = await _client.get(Uri.parse('$base/api/anchor/status')).timeout(const Duration(seconds: 8));
     if (res.statusCode != 200) {
       throw Exception('存证状态查询失败');
     }

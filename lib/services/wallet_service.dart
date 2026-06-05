@@ -3,18 +3,40 @@ import '../utils/wallet_derive.dart';
 import 'wallet_secrets.dart';
 import 'wallet_storage.dart';
 
-/// 本地多链钱包门面（pmsj 能力 minus 云备份 / minus 服务端 wallet API）
+/// 本地单钱包门面：每账户仅绑定一个链上地址
 class WalletService {
-  static Future<WalletAccount?> getActiveAccount() => WalletStorage.getActiveWallet();
+  static Future<WalletAccount?> getActiveAccount() async {
+    await enforceSingleWallet();
+    return WalletStorage.getActiveWallet();
+  }
 
   static Future<String?> getActiveAddress() async {
     final a = await getActiveAccount();
     return a?.address;
   }
 
-  static Future<List<WalletAccount>> listWallets() => WalletStorage.loadWallets();
+  static Future<List<WalletAccount>> listWallets() async {
+    await enforceSingleWallet();
+    return WalletStorage.loadWallets();
+  }
+
+  /// 旧版多钱包数据迁移：仅保留当前激活钱包
+  static Future<void> enforceSingleWallet() async {
+    final wallets = await WalletStorage.loadWallets();
+    if (wallets.length <= 1) return;
+
+    final active = await WalletStorage.getActiveWallet();
+    final keep = active ?? wallets.last;
+    for (final w in wallets) {
+      if (w.address != keep.address || w.chain != keep.chain) {
+        await WalletSecrets.delete(w.chain, w.address);
+      }
+    }
+    await WalletStorage.saveWallet(keep);
+  }
 
   static Future<WalletAccount> createWallet({String chain = 'TRON', String? label}) async {
+    await _clearExisting();
     final derived = WalletDerive.createNew(chain);
     final account = WalletAccount(
       address: derived['address']!,
@@ -29,7 +51,6 @@ class WalletService {
       privateKey: derived['privateKey'],
     );
     await WalletStorage.saveWallet(account);
-    await WalletStorage.setActiveWallet(account.address, account.chain);
     return account;
   }
 
@@ -38,6 +59,7 @@ class WalletService {
     String chain = 'TRON',
     String? label,
   }) async {
+    await _clearExisting();
     final derived = WalletDerive.fromMnemonic(mnemonic, chain);
     final account = WalletAccount(
       address: derived['address']!,
@@ -52,34 +74,30 @@ class WalletService {
       privateKey: derived['privateKey'],
     );
     await WalletStorage.saveWallet(account);
-    await WalletStorage.setActiveWallet(account.address, account.chain);
     return account;
-  }
-
-  static Future<void> switchWallet(WalletAccount account) async {
-    await WalletStorage.setActiveWallet(account.address, account.chain);
   }
 
   static Future<void> removeWallet(WalletAccount account) async {
     await WalletSecrets.delete(account.chain, account.address);
     await WalletStorage.deleteWallet(account.address, account.chain);
-    final active = await getActiveAccount();
-    if (active?.address == account.address && active?.chain == account.chain) {
-      final rest = await listWallets();
-      if (rest.isNotEmpty) {
-        await switchWallet(rest.first);
-      } else {
-        await WalletStorage.setActiveWallet(null, null);
-      }
-    }
+    await WalletStorage.setActiveWallet(null, null);
   }
 
   static Future<void> clearAll() async {
-    final wallets = await listWallets();
+    final wallets = await WalletStorage.loadWallets();
     for (final w in wallets) {
       await WalletSecrets.delete(w.chain, w.address);
-      await WalletStorage.deleteWallet(w.address, w.chain);
     }
+    await WalletStorage.replaceAllWallets([]);
+    await WalletStorage.setActiveWallet(null, null);
+  }
+
+  static Future<void> _clearExisting() async {
+    final wallets = await WalletStorage.loadWallets();
+    for (final w in wallets) {
+      await WalletSecrets.delete(w.chain, w.address);
+    }
+    await WalletStorage.replaceAllWallets([]);
     await WalletStorage.setActiveWallet(null, null);
   }
 

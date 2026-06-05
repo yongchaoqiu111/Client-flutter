@@ -5,6 +5,7 @@ class NodeConfig {
     required this.apiUrl,
     required this.wsUrl,
     this.status = 'unknown',
+    this.latencyMs,
   });
 
   final String id;
@@ -12,6 +13,7 @@ class NodeConfig {
   final String apiUrl;
   final String wsUrl;
   final String status;
+  final int? latencyMs;
 
   factory NodeConfig.fromJson(Map<String, dynamic> json) {
     return NodeConfig(
@@ -20,6 +22,7 @@ class NodeConfig {
       apiUrl: json['apiUrl'] as String? ?? '',
       wsUrl: json['wsUrl'] as String? ?? '',
       status: json['status'] as String? ?? 'unknown',
+      latencyMs: (json['latencyMs'] as num?)?.toInt(),
     );
   }
 
@@ -29,25 +32,41 @@ class NodeConfig {
         'apiUrl': apiUrl,
         'wsUrl': wsUrl,
         'status': status,
+        if (latencyMs != null) 'latencyMs': latencyMs,
       };
 
-  NodeConfig copyWith({String? status}) {
+  String get displayStatus {
+    switch (status) {
+      case 'probing':
+        return '检测中…';
+      case 'online':
+        if (latencyMs != null) return '在线 · ${latencyMs}ms';
+        return '在线';
+      case 'offline':
+        return '离线';
+      default:
+        return '未知';
+    }
+  }
+
+  NodeConfig copyWith({String? status, int? latencyMs, bool clearLatency = false}) {
     return NodeConfig(
       id: id,
       name: name,
       apiUrl: apiUrl,
       wsUrl: wsUrl,
       status: status ?? this.status,
+      latencyMs: clearLatency ? null : (latencyMs ?? this.latencyMs),
     );
   }
 
   static NodeConfig defaultGateway() {
     return NodeConfig(
-      id: 'gateway',
-      name: '默认网关',
-      apiUrl: 'http://127.0.0.1:8443',
-      wsUrl: 'ws://127.0.0.1:8443/ws',
-      status: 'online',
+      id: 'book26_top',
+      name: '网关 A · book26',
+      apiUrl: 'https://book26.top',
+      wsUrl: 'wss://book26.top/ws',
+      status: 'unknown',
     );
   }
 }

@@ -2,11 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
 
-import '../config/payment_config.dart';
 import '../models/queue_tier.dart';
 import '../providers/app_state.dart';
-import '../widgets/pin_dialog.dart';
 
+/// 确认排单意向：仅扣排单券、提交排队，不展示收款账户（匹配后才有支付信息）
 class OrderConfirmScreen extends StatefulWidget {
   const OrderConfirmScreen({required this.tier, super.key});
 
@@ -18,67 +17,38 @@ class OrderConfirmScreen extends StatefulWidget {
 
 class _OrderConfirmScreenState extends State<OrderConfirmScreen> {
   bool _submitting = false;
-  bool _paying = false;
-  String? _orderId;
-  late final num _payAmount;
-  bool? _anchorOk;
-
-  @override
-  void initState() {
-    super.initState();
-    _payAmount = widget.tier.amount + (DateTime.now().millisecond % 100) / 100;
-    _loadAnchor();
-  }
-
-  Future<void> _loadAnchor() async {
-    final s = context.read<AppState>().anchorStatus;
-    setState(() => _anchorOk = s?.verified ?? false);
-  }
 
   Future<void> _submit() async {
     setState(() => _submitting = true);
     try {
-      final id = await context.read<AppState>().submitQueueOrder(widget.tier);
-      setState(() => _orderId = id);
+      final state = context.read<AppState>();
+      if (state.ticketBalance < widget.tier.ticketCost) {
+        throw Exception('排单券不足，请先购买');
+      }
+      final id = await state.submitQueueOrder(widget.tier);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已提交：${widget.tier.amount} TRX 已计入资金池，等待匹配支付信息')),
+      );
+      context.go('/order/$id');
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+      }
     } finally {
       if (mounted) setState(() => _submitting = false);
-    }
-  }
-
-  Future<void> _pay() async {
-    if (_orderId == null) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先提交排单')));
-      return;
-    }
-    if (!await showPayPinDialog(context)) return;
-    setState(() => _paying = true);
-    try {
-      final state = context.read<AppState>();
-      final tx = await state.payOrderOnChain(
-        orderId: _orderId!,
-        payAmount: _payAmount,
-        treasury: PaymentConfig.treasuryAddress,
-      );
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('支付已确认 tx: ${tx.substring(0, 12)}…')));
-      context.pop();
-    } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
-    } finally {
-      if (mounted) setState(() => _paying = false);
     }
   }
 
   @override
   Widget build(BuildContext context) {
     final tier = widget.tier;
-    final demo = context.watch<AppState>().demoPayments;
-    final anchor = context.watch<AppState>().anchorStatus;
+    final tickets = context.watch<AppState>().ticketBalance;
+    final reservoir = context.watch<AppState>().reservoir;
+    final canSubmit = tickets >= tier.ticketCost;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('确认订单')),
+      appBar: AppBar(title: const Text('确认排单意向')),
       body: ListView(
         padding: const EdgeInsets.all(20),
         children: [
@@ -88,9 +58,11 @@ class _OrderConfirmScreenState extends State<OrderConfirmScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('${tier.name} (${tier.amount} TRX)'),
-                  Text('消耗券 ${tier.ticketCost} 张'),
+                  Text('${tier.name} (${tier.amount} TRX)', style: const TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                  Text('消耗排单券 ${tier.ticketCost} 张（当前余额 $tickets 张）'),
                   Text('预期出场 ${tier.exitAmount} TRX'),
+                  Text('收益率 ${(tier.profitRate * 100).toStringAsFixed(0)}%'),
                 ],
               ),
             ),
@@ -102,47 +74,39 @@ class _OrderConfirmScreenState extends State<OrderConfirmScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text('支付信息', style: TextStyle(fontWeight: FontWeight.bold)),
-                  Text('收款: ${PaymentConfig.treasuryAddress}'),
-                  Text('金额: $_payAmount TRX'),
-                  Text(demo ? '模式: 演示支付（本地哈希）' : '模式: 链上转账（BSC 可用）'),
-                  const SizedBox(height: 12),
-                  FilledButton(
-                    onPressed: (_paying || _orderId == null) ? null : _pay,
-                    child: _paying
-                        ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2))
-                        : const Text('二级密码确认并支付'),
+                  const Text('流程说明', style: TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                  const Text(
+                    '1. 本页提交排单意向，扣除排单券\n'
+                    '2. 系统记录存证哈希：您的地址、扣券数、档位金额、预约时间\n'
+                    '3. 档位金额立即计入资金池（如 3000 TRX 则池内 +3000）\n'
+                    '4. 资金池满额后匹配收款方，详情页才显示应付地址与金额\n'
+                    '5. 匹配成功后再进行链上支付',
+                    style: TextStyle(color: Colors.white70, height: 1.5, fontSize: 13),
                   ),
+                  if (reservoir != null) ...[
+                    const SizedBox(height: 12),
+                    Text(
+                      '当前蓄水池：${reservoir.currentAmount.toStringAsFixed(0)} / '
+                      '${reservoir.currentTarget.toStringAsFixed(0)} TRX',
+                      style: const TextStyle(fontSize: 12, color: Colors.cyan),
+                    ),
+                  ],
                 ],
               ),
             ),
           ),
-          const SizedBox(height: 16),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('存证验证', style: TextStyle(fontWeight: FontWeight.bold)),
-                  Text(
-                    anchor != null && anchor.verified
-                        ? 'Merkle 根 ${anchor.merkleRoot?.substring(0, 14) ?? "—"}… · ${anchor.recordCount} 条事件'
-                        : '等待 Raft 事件（提交排单后可用）',
-                    style: const TextStyle(fontSize: 12, color: Colors.white54),
-                  ),
-                  if (_anchorOk == false)
-                    const Text('打币前需共识事件存证', style: TextStyle(color: Colors.orange, fontSize: 12)),
-                ],
-              ),
-            ),
-          ),
+          if (!canSubmit) ...[
+            const SizedBox(height: 12),
+            const Text('排单券不足，请先购买', style: TextStyle(color: Colors.orange)),
+            TextButton(onPressed: () => context.push('/ticket'), child: const Text('去购买排单券')),
+          ],
           const SizedBox(height: 24),
           FilledButton(
-            onPressed: _submitting ? null : _submit,
+            onPressed: (_submitting || !canSubmit) ? null : _submit,
             child: _submitting
                 ? const SizedBox(height: 22, width: 22, child: CircularProgressIndicator(strokeWidth: 2))
-                : const Text('提交排单到共识节点'),
+                : const Text('确认提交排单意向'),
           ),
         ],
       ),

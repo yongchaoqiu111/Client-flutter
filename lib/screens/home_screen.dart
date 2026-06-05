@@ -2,9 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
-import 'package:qr_flutter/qr_flutter.dart';
-
 import '../providers/app_state.dart';
+import '../widgets/referral_qr_dialog.dart';
 
 class HomeScreen extends StatelessWidget {
   const HomeScreen({super.key});
@@ -89,12 +88,22 @@ class HomeScreen extends StatelessWidget {
             children: [
               _statCard('团队人数', '${d?.teamCount ?? 0}'),
               const SizedBox(width: 8),
-              _statCard('考核完成', '${d?.checkinRate.toStringAsFixed(0)}%'),
+              _statCard(
+                '考核完成',
+                d?.checkinRate != null ? '${d!.checkinRate.toStringAsFixed(0)}%' : '—',
+              ),
             ],
           ),
           if (state.error != null) ...[
             const SizedBox(height: 12),
-            Text(state.error!, style: const TextStyle(color: Colors.orange)),
+            Card(
+              color: Colors.orange.withOpacity(0.15),
+              child: ListTile(
+                title: Text(state.error!, style: const TextStyle(color: Colors.orange)),
+                trailing: const Icon(Icons.settings_ethernet, color: Colors.orange),
+                onTap: () => context.push('/me/nodes/pick'),
+              ),
+            ),
           ],
         ],
       ),
@@ -123,11 +132,10 @@ class HomeScreen extends StatelessWidget {
                   icon: const Icon(Icons.qr_code, size: 18),
                   onPressed: state.address == null
                       ? null
-                      : () => showDialog(
-                            context: context,
-                            builder: (ctx) => AlertDialog(
-                              content: QrImageView(data: state.address!, size: 180),
-                            ),
+                      : () => showReferralQrDialog(
+                            context,
+                            address: state.address!,
+                            title: '推荐二维码',
                           ),
                 ),
               ],

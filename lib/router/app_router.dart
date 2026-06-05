@@ -5,6 +5,8 @@ import '../screens/bootstrap_screen.dart';
 import '../screens/chat_hall_screen.dart';
 import '../screens/help_screen.dart';
 import '../screens/live_room_screen.dart';
+import '../screens/podcast_player_screen.dart';
+import '../models/podcast_episode.dart';
 import '../screens/mnemonic_backup_screen.dart';
 import '../screens/my_orders_screen.dart';
 import '../screens/node_config_screen.dart';
@@ -23,6 +25,7 @@ import '../models/queue_tier.dart';
 import '../screens/wallet_management_screen.dart';
 import '../screens/wallet_setup_screen.dart';
 import '../screens/welcome_screen.dart';
+import '../services/app_settings_service.dart';
 import '../services/pin_service.dart';
 import '../services/wallet_service.dart';
 
@@ -32,7 +35,12 @@ GoRouter createAppRouter() {
     routes: [
       GoRoute(path: '/bootstrap', builder: (_, __) => const BootstrapScreen()),
       GoRoute(path: '/welcome', builder: (_, __) => const WelcomeScreen()),
-      GoRoute(path: '/wallet-setup', builder: (_, __) => const WalletSetupScreen()),
+      GoRoute(
+        path: '/wallet-setup',
+        builder: (_, state) => WalletSetupScreen(
+          importMode: state.uri.queryParameters['mode'] == 'import',
+        ),
+      ),
       GoRoute(
         path: '/mnemonic-backup',
         builder: (_, state) => MnemonicBackupScreen(
@@ -61,6 +69,10 @@ GoRouter createAppRouter() {
         path: '/podcast/room/:id',
         builder: (_, state) => LiveRoomScreen(roomId: state.pathParameters['id']!),
       ),
+      GoRoute(
+        path: '/podcast/play',
+        builder: (_, state) => PodcastPlayerScreen(episode: state.extra! as PodcastEpisode),
+      ),
       GoRoute(path: '/chat', builder: (_, __) => const ChatHallScreen()),
       GoRoute(path: '/me/performance', builder: (_, __) => const PerformanceScreen()),
       GoRoute(path: '/me/rewards', builder: (_, __) => const RewardsScreen()),
@@ -74,6 +86,9 @@ GoRouter createAppRouter() {
 Future<String> resolveStartupRoute() async {
   final wallet = await WalletService.getActiveAccount();
   if (wallet == null) return '/welcome';
+  if (await AppSettingsService.isMnemonicBackupPending()) {
+    return '/mnemonic-backup';
+  }
   final hasPin = await PinService.hasPin();
   if (!hasPin) return '/pin-setup';
   return '/app';

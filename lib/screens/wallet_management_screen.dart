@@ -1,15 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:provider/provider.dart';
-import 'package:qr_flutter/qr_flutter.dart';
-
 import '../models/wallet_account.dart';
-import '../providers/app_state.dart';
+import '../widgets/referral_qr_dialog.dart';
 import '../services/chain_rpc_service.dart';
 import '../services/wallet_secrets.dart';
 import '../services/wallet_service.dart';
 
-/// 钱包管理（借鉴 pmsj WalletManagementPage，无云备份）
+/// 钱包管理：每账户仅一个钱包地址
 class WalletManagementScreen extends StatefulWidget {
   const WalletManagementScreen({super.key});
 
@@ -18,10 +15,9 @@ class WalletManagementScreen extends StatefulWidget {
 }
 
 class _WalletManagementScreenState extends State<WalletManagementScreen> {
-  List<WalletAccount> _wallets = [];
-  WalletAccount? _active;
-  final _balanceMap = <String, double>{};
-  bool _loading = true;
+  WalletAccount? _wallet;
+  double? _balance;
+  bool _balanceLoading = false;
 
   @override
   void initState() {
@@ -30,51 +26,25 @@ class _WalletManagementScreenState extends State<WalletManagementScreen> {
   }
 
   Future<void> _reload() async {
-    setState(() => _loading = true);
-    _wallets = await WalletService.listWallets();
-    _active = await WalletService.getActiveAccount();
-    for (final w in _wallets) {
-      try {
-        _balanceMap['${w.chain}:${w.address}'] =
-            await ChainRpcService.getBalance(w.chain, w.address);
-      } catch (_) {
-        _balanceMap['${w.chain}:${w.address}'] = 0;
-      }
-    }
-    if (mounted) setState(() => _loading = false);
+    final wallet = await WalletService.getActiveAccount();
+    if (!mounted) return;
+    setState(() {
+      _wallet = wallet;
+      _balance = null;
+      _balanceLoading = wallet != null;
+    });
+    if (wallet == null) return;
+    _loadBalance(wallet);
   }
 
-  Future<void> _create(String chain) async {
-    await WalletService.createWallet(chain: chain);
-    await context.read<AppState>().reloadWallet();
-    await _reload();
-  }
-
-  Future<void> _import(String chain) async {
-    final ctrl = TextEditingController();
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text('导入 $chain 钱包'),
-        content: TextField(
-          controller: ctrl,
-          maxLines: 3,
-          decoration: const InputDecoration(hintText: '12/24 个英文助记词'),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
-          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('导入')),
-        ],
-      ),
-    );
-    if (ok != true) return;
+  Future<void> _loadBalance(WalletAccount wallet) async {
     try {
-      await WalletService.importWallet(mnemonic: ctrl.text, chain: chain);
-      await context.read<AppState>().reloadWallet();
-      await _reload();
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+      final bal = await ChainRpcService.getBalance(wallet.chain, wallet.address);
+      if (mounted) setState(() => _balance = bal);
+    } catch (_) {
+      if (mounted) setState(() => _balance = 0);
+    } finally {
+      if (mounted) setState(() => _balanceLoading = false);
     }
   }
 
@@ -95,96 +65,80 @@ class _WalletManagementScreenState extends State<WalletManagementScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final w = _wallet;
+    final unit = w?.chain == 'TRON' ? 'TRX' : 'BNB';
+
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('钱包管理'),
-        actions: [
-          PopupMenuButton<String>(
-            onSelected: _create,
-            itemBuilder: (_) => [
-              const PopupMenuItem(value: 'TRON', child: Text('创建 TRON 钱包')),
-              const PopupMenuItem(value: 'BSC', child: Text('创建 BSC 钱包')),
-            ],
+      appBar: AppBar(title: const Text('钱包管理')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          const Text(
+            '每个账户仅绑定一个钱包地址，注册时创建，不可新增多个',
+            style: TextStyle(color: Colors.white54, height: 1.4),
           ),
+          const SizedBox(height: 16),
+          if (w == null)
+            const Card(
+              child: Padding(
+                padding: EdgeInsets.all(20),
+                child: Text('暂无钱包，请完成注册流程创建'),
+              ),
+            )
+          else
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(14),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(w.label ?? w.chain, style: const TextStyle(fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 4),
+                    Text(w.address, style: const TextStyle(fontSize: 12, color: Colors.white70)),
+                    const SizedBox(height: 6),
+                    if (_balanceLoading)
+                      const Text('余额查询中…', style: TextStyle(color: Colors.white54))
+                    else
+                      Text(
+                        '余额: ${(_balance ?? 0).toStringAsFixed(4)} $unit',
+                        style: const TextStyle(color: Colors.white54),
+                      ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        IconButton(
+                          icon: const Icon(Icons.copy, size: 18),
+                          onPressed: () => Clipboard.setData(ClipboardData(text: w.address)),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.qr_code, size: 18),
+                          onPressed: () => showReferralQrDialog(
+                            context,
+                            address: w.address,
+                            title: '钱包推荐码',
+                          ),
+                        ),
+                        TextButton(
+                          onPressed: () => _showMnemonic(w),
+                          child: const Text('查看助记词'),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.refresh, size: 18),
+                          tooltip: '刷新余额',
+                          onPressed: _balanceLoading
+                              ? null
+                              : () {
+                                  setState(() => _balanceLoading = true);
+                                  _loadBalance(w);
+                                },
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
         ],
-      ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : ListView(
-              padding: const EdgeInsets.all(16),
-              children: [
-                const Text('私钥与助记词仅在本机安全存储，无云备份', style: TextStyle(color: Colors.white54)),
-                const SizedBox(height: 16),
-                if (_wallets.isEmpty)
-                  const Card(
-                    child: Padding(
-                      padding: EdgeInsets.all(20),
-                      child: Text('暂无钱包，请创建或导入'),
-                    ),
-                  ),
-                ..._wallets.map(_walletTile),
-                const SizedBox(height: 16),
-                OutlinedButton(onPressed: () => _import('TRON'), child: const Text('导入 TRON 助记词')),
-                const SizedBox(height: 8),
-                OutlinedButton(onPressed: () => _import('BSC'), child: const Text('导入 BSC 助记词')),
-              ],
-            ),
-    );
-  }
-
-  Widget _walletTile(WalletAccount w) {
-    final isActive = _active?.address == w.address && _active?.chain == w.chain;
-    final bal = _balanceMap['${w.chain}:${w.address}'] ?? 0;
-    final unit = w.chain == 'TRON' ? 'TRX' : 'BNB';
-
-    return Card(
-      margin: const EdgeInsets.only(bottom: 12),
-      child: Padding(
-        padding: const EdgeInsets.all(14),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Text(w.label ?? w.chain, style: const TextStyle(fontWeight: FontWeight.bold)),
-                if (isActive) ...[
-                  const SizedBox(width: 8),
-                  const Chip(label: Text('当前', style: TextStyle(fontSize: 10)), padding: EdgeInsets.zero),
-                ],
-              ],
-            ),
-            Text(w.address, style: const TextStyle(fontSize: 12, color: Colors.white70)),
-            Text('余额: ${bal.toStringAsFixed(4)} $unit', style: const TextStyle(color: Colors.white54)),
-            const SizedBox(height: 10),
-            Row(
-              children: [
-                IconButton(
-                  icon: const Icon(Icons.copy, size: 18),
-                  onPressed: () => Clipboard.setData(ClipboardData(text: w.address)),
-                ),
-                IconButton(
-                  icon: const Icon(Icons.qr_code, size: 18),
-                  onPressed: () => showDialog(
-                    context: context,
-                    builder: (ctx) => AlertDialog(
-                      content: QrImageView(data: w.address, size: 200),
-                    ),
-                  ),
-                ),
-                TextButton(onPressed: () => _showMnemonic(w), child: const Text('查看助记词')),
-                if (!isActive)
-                  TextButton(
-                    onPressed: () async {
-                      await WalletService.switchWallet(w);
-                      await context.read<AppState>().reloadWallet();
-                      await _reload();
-                    },
-                    child: const Text('切换'),
-                  ),
-              ],
-            ),
-          ],
-        ),
       ),
     );
   }

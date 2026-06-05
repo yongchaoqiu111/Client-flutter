@@ -5,6 +5,11 @@ class QueueOrder {
     required this.amount,
     required this.status,
     this.payAmount,
+    this.payeeAddress,
+    this.matchedAt,
+    this.queuedAtText,
+    this.queuedContentHash,
+    this.poolContributed,
     this.ticketCost = 0,
     this.tierName = '',
     this.expectedExit = 0,
@@ -21,6 +26,11 @@ class QueueOrder {
   final num amount;
   final String status;
   final num? payAmount;
+  final String? payeeAddress;
+  final int? matchedAt;
+  final String? queuedAtText;
+  final String? queuedContentHash;
+  final num? poolContributed;
   final int ticketCost;
   final String tierName;
   final num expectedExit;
@@ -38,6 +48,11 @@ class QueueOrder {
       amount: json['amount'] as num? ?? 0,
       status: json['status'] as String? ?? 'pending',
       payAmount: json['payAmount'] as num?,
+      payeeAddress: json['payeeAddress'] as String?,
+      matchedAt: (json['matchedAt'] as num?)?.toInt(),
+      queuedAtText: json['queuedAtText'] as String?,
+      queuedContentHash: json['queuedContentHash'] as String?,
+      poolContributed: json['poolContributed'] as num?,
       ticketCost: (json['ticketCost'] as num?)?.toInt() ?? 0,
       tierName: json['tierName'] as String? ?? '',
       expectedExit: json['expectedExit'] as num? ?? 0,
@@ -57,10 +72,12 @@ class QueueOrder {
 
   String get statusLabel {
     switch (status) {
+      case 'queued':
+        return '已入池排队（待匹配支付）';
       case 'waiting_payment':
-        return '支付中';
+        return '待支付';
       case 'confirmed':
-        return '排队中';
+        return '已入池';
       case 'exiting':
         return '收益中';
       case 'exited':

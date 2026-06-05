@@ -4,7 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/wallet_account.dart';
 
-/// 多钱包元数据本地存储（借鉴 pmsj wallet_storage.dart，不含云端备份）
+/// 本地钱包元数据（每账户仅一个钱包地址）
 class WalletStorage {
   static const _walletsKey = 'mmm_wallets_v1';
   static const _activeKey = 'mmm_active_wallet_v1';
@@ -20,31 +20,25 @@ class WalletStorage {
         .toList();
   }
 
+  /// 保存唯一钱包（替换旧地址，不追加）
   static Future<void> saveWallet(WalletAccount account) async {
-    final wallets = await loadWallets();
-    final idx = wallets.indexWhere(
-      (w) => w.address == account.address && w.chain == account.chain,
-    );
-    if (idx >= 0) {
-      wallets[idx] = account;
-    } else {
-      wallets.add(account);
-    }
+    await replaceAllWallets([account]);
+    await setActiveWallet(account.address, account.chain);
+  }
+
+  static Future<void> replaceAllWallets(List<WalletAccount> wallets) async {
     final prefs = await SharedPreferences.getInstance();
+    final single = wallets.isEmpty ? <WalletAccount>[] : [wallets.last];
     await prefs.setString(
       _walletsKey,
-      jsonEncode(wallets.map((w) => w.toJson()).toList()),
+      jsonEncode(single.map((w) => w.toJson()).toList()),
     );
   }
 
   static Future<void> deleteWallet(String address, String chain) async {
     final wallets = await loadWallets();
     wallets.removeWhere((w) => w.address == address && w.chain == chain);
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(
-      _walletsKey,
-      jsonEncode(wallets.map((w) => w.toJson()).toList()),
-    );
+    await replaceAllWallets(wallets);
   }
 
   static Future<void> setActiveWallet(String? address, String? chain) async {
@@ -65,6 +59,7 @@ class WalletStorage {
     for (final w in wallets) {
       if (w.address == m['address'] && w.chain == m['chain']) return w;
     }
+    if (wallets.isNotEmpty) return wallets.first;
     return null;
   }
 

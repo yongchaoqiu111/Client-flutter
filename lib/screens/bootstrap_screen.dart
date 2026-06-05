@@ -20,10 +20,16 @@ class _BootstrapScreenState extends State<BootstrapScreen> {
   }
 
   Future<void> _start() async {
-    await context.read<AppState>().bootstrap();
+    try {
+      await context.read<AppState>().bootstrap().timeout(const Duration(seconds: 8));
+    } catch (_) {}
     if (!mounted) return;
-    final route = await resolveStartupRoute();
-    context.go(route);
+    try {
+      final route = await resolveStartupRoute().timeout(const Duration(seconds: 5));
+      context.go(route);
+    } catch (_) {
+      if (mounted) context.go('/welcome');
+    }
   }
 
   @override
