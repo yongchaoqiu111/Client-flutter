@@ -76,6 +76,66 @@ class ChainRpcService {
     return wei.toDouble() / BigInt.from(10).pow(decimals).toDouble();
   }
 
+  /// 波场实时带宽：POST /wallet/getaccountresource
+  static Future<TronBandwidthStatus> fetchTronBandwidth(String address) async {
+    final node = ChainConfig.tron.nodes.first;
+    final uri = Uri.parse('${node.replaceAll(RegExp(r'/+$'), '')}/wallet/getaccountresource');
+    final res = await http
+        .post(
+          uri,
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'address': address, 'visible': true}),
+        )
+        .timeout(const Duration(seconds: 6));
+    if (res.statusCode != 200) throw Exception('getaccountresource HTTP ${res.statusCode}');
+    final body = jsonDecode(res.body) as Map<String, dynamic>;
+    return TronBandwidthStatus.fromJson(body);
+  }
+
+  /// 预估单笔转账燃料费（与转账金额分开扣除）
+  static Future<TransferFeeEstimate> estimateTransferFee(String chain, String fromAddress) async {
+    final c = chain.toUpperCase();
+    if (c == 'TRON') {
+      return _estimateTrxTransferFee(fromAddress);
+    }
+    if (c == 'BSC') {
+      return const TransferFeeEstimate(
+        fee: 0.00025,
+        label: '约 0.00025 BNB',
+        note: '按当前 BSC 网络 gas 估算，实际以链上为准',
+      );
+    }
+    return const TransferFeeEstimate(fee: 0, label: '—', note: '');
+  }
+
+  static Future<TransferFeeEstimate> _estimateTrxTransferFee(String address) async {
+    const fallback = TransferFeeEstimate(
+      fee: 0.268,
+      label: '约 0.268 TRX',
+      note: '带宽不足时将燃烧 TRX（查询失败，按常见值估算）',
+    );
+    try {
+      final bw = await fetchTronBandwidth(address);
+      if (bw.canCoverTransfer) {
+        return TransferFeeEstimate(
+          fee: 0,
+          label: '约 0 TRX（消耗带宽）',
+          note: '剩余带宽 ${bw.totalAvailableBp} BP，本笔约 ${TronBandwidthStatus.transferCostBp} BP；'
+              '免费 ${bw.freeRemainingBp} + 质押 ${bw.stakedRemainingBp}',
+          bandwidth: bw,
+        );
+      }
+      return TransferFeeEstimate(
+        fee: 0.268,
+        label: '约 0.268 TRX（烧 TRX）',
+        note: '总可用带宽 ${bw.totalAvailableBp} BP，不足 ${TronBandwidthStatus.transferCostBp} BP，将燃烧 TRX',
+        bandwidth: bw,
+      );
+    } catch (_) {
+      return fallback;
+    }
+  }
+
   static Future<double> _firstSuccess(
     Iterable<Future<double>> tasks,
     String errorMessage,
@@ -102,4 +162,50 @@ class _CacheEntry {
   _CacheEntry(this.balance, this.at);
   final double balance;
   final DateTime at;
+}
+
+class TransferFeeEstimate {
+  const TransferFeeEstimate({
+    required this.fee,
+    required this.label,
+    required this.note,
+    this.bandwidth,
+  });
+
+  final double fee;
+  final String label;
+  final String note;
+  final TronBandwidthStatus? bandwidth;
+}
+
+/// TronGrid getaccountresource 解析（商用钱包同款公式）
+class TronBandwidthStatus {
+  TronBandwidthStatus({
+    required this.freeNetLimit,
+    required this.freeNetUsed,
+    required this.netLimit,
+    required this.netUsed,
+  });
+
+  /// 普通 TRX 转账（无 memo）固定约 267 BP
+  static const transferCostBp = 267;
+
+  final int freeNetLimit;
+  final int freeNetUsed;
+  final int netLimit;
+  final int netUsed;
+
+  int get freeRemainingBp => freeNetLimit - freeNetUsed;
+  int get stakedRemainingBp => netLimit - netUsed;
+  int get totalAvailableBp => freeRemainingBp + stakedRemainingBp;
+  bool get canCoverTransfer => totalAvailableBp >= transferCostBp;
+
+  factory TronBandwidthStatus.fromJson(Map<String, dynamic> json) {
+    return TronBandwidthStatus(
+      freeNetLimit: (json['freeNetLimit'] as num?)?.toInt() ?? 0,
+      freeNetUsed: (json['freeNetUsed'] as num?)?.toInt() ?? 0,
+      netLimit: (json['NetLimit'] as num?)?.toInt() ?? 0,
+      netUsed: (json['NetUsed'] as num?)?.toInt() ?? 0,
+    );
+  }
 }

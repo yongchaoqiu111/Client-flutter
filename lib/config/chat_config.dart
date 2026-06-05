@@ -11,4 +11,9 @@ class ChatConfig {
 
   static const rulesHint =
       '每 30 秒可发 1 条；自动屏蔽微信/QQ/电话/诈骗/传销等违规内容';
+
+  /// 播客页直播间卡片 A/B/C → WSS 房间号
+  static String liveRoomId(String card) => 'live_${card.toLowerCase()}';
+
+  static String liveRoomTitle(String card) => '直播间 ${card.toUpperCase()}';
 }

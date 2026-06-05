@@ -3,9 +3,9 @@ import '../models/chat_send_result.dart';
 
 /// 群聊发言频控 + 违规内容过滤（前端执行，收发双向）
 class ChatModerationService {
-  static final _phone131 = RegExp(r'1\s*3\s*[1-9]\s*\d[\s\-]?\d{4}[\s\-]?\d{4}');
-  static final _phone170 = RegExp(r'1\s*7\s*[0-9]\s*\d[\s\-]?\d{4}[\s\-]?\d{4}');
-  static final _qqPattern = RegExp(r'(?i)(qq|q\s*群|扣扣)');
+  static final _phone131 = RegExp(r'(?:^|[^\d])1\s*3\s*[1-9](?:\s*\d){8}(?:[^\d]|$)');
+  static final _phone170 = RegExp(r'(?:^|[^\d])1\s*7\s*[0-9](?:\s*\d){8}(?:[^\d]|$)');
+  static final _qqPattern = RegExp(r'(qq|q\s*群|扣扣)', caseSensitive: false);
   static final _wechatPattern = RegExp(r'(微信|weixin|wechat|微\s*信|v\s*信|vx|wx\s*号)');
   static final _scamKeywords = RegExp(
     r'(诈骗|欺骗|传销|资金盘|割韭菜|稳赚|躺赚|日入|月入百万|拉人头|发展下线|'

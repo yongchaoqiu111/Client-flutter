@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../config/app_build_info.dart';
 import '../config/chain_config.dart';
 import '../providers/app_state.dart';
 
@@ -38,7 +39,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
             value: demo,
             onChanged: (v) => context.read<AppState>().setDemoPayments(v),
           ),
-          const ListTile(title: Text('版本'), trailing: Text('1.0.0')),
+          ListTile(
+            title: const Text('版本'),
+            subtitle: Text(AppBuildInfo.buildTag),
+            trailing: Text(AppBuildInfo.versionLabel),
+          ),
           const ListTile(
             title: Text('出场加速'),
             subtitle: Text('node1 默认 DEMO_FAST_EXIT=1（约 1 分钟入队、30 秒/日发放）'),

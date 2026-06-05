@@ -38,35 +38,57 @@ class RaftApiService {
         path,
       );
 
-  Future<http.Response> _post(String path, Map<String, dynamic> body) => _request(
-        (client, url) => client.post(
-          url,
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode(body),
-        ),
-        path,
-      );
+  Future<http.Response> _post(String path, Map<String, dynamic> body) {
+    final encoded = jsonEncode(body);
+    return _request(
+      (client, url) => client.post(
+        url,
+        headers: {'Content-Type': 'application/json'},
+        body: encoded,
+      ),
+      path,
+      body: encoded,
+      method: 'POST',
+    );
+  }
 
   Future<http.Response> _request(
     Future<http.Response> Function(http.Client client, Uri url) call,
-    String path,
-  ) async {
+    String path, {
+    String? body,
+    String method = 'GET',
+  }) async {
     final url = Uri.parse('$_base$path');
     try {
       return await call(_client, url).timeout(_timeout);
     } catch (e) {
-      NetworkDebug.log('API', 'GET/POST $path 域名失败: $e');
+      NetworkDebug.log('API', '$method $path 域名失败: $e');
       if (!GatewayHttpClient.isRetriableError(e)) rethrow;
       final ipBase = GatewayHttpClient.ipBaseFor(_base);
       if (ipBase == null) rethrow;
-      NetworkDebug.log('API', 'GET/POST $path 改 IP $ipBase');
-      final ipClient = IOClient(GatewayHttpClient.createIpDirectClient());
-      try {
-        return await call(ipClient, Uri.parse('$ipBase$path')).timeout(_timeout);
-      } finally {
-        ipClient.close();
-      }
+      final host = Uri.parse(_base).host;
+      NetworkDebug.log('API', '$method $path 改 IP $ipBase Host=$host');
+      return GatewayHttpClient.requestViaIp(
+        method: method,
+        ipBase: ipBase,
+        path: path,
+        hostHeader: host,
+        body: body,
+        timeout: _timeout,
+      );
     }
+  }
+
+  Map<String, dynamic> _decodeJsonMap(http.Response res, {String? action}) {
+    try {
+      final decoded = jsonDecode(res.body);
+      if (decoded is Map<String, dynamic>) return decoded;
+      if (decoded is Map) return Map<String, dynamic>.from(decoded);
+    } catch (_) {}
+    final snippet = res.body.length > 160 ? '${res.body.substring(0, 160)}…' : res.body;
+    throw Exception(
+      '${action ?? '请求'}失败 HTTP ${res.statusCode}：$snippet',
+    );
   }
 
   Future<NodeProbeResult> probeHealth() => GatewayPing.ping(_base);
@@ -120,6 +142,20 @@ class RaftApiService {
       final body = jsonDecode(res.body) as Map<String, dynamic>;
       throw Exception(body['error'] ?? '提交失败');
     }
+  }
+
+  Future<void> setPaymentAddress({
+    required String userAddress,
+    required String paymentAddress,
+  }) async {
+    await submitCommand(
+      {
+        'type': 'SET_PAYMENT_ADDRESS',
+        'userAddress': userAddress,
+        'paymentAddress': paymentAddress,
+      },
+      signerAddress: userAddress,
+    );
   }
 
   Future<void> registerUser({
@@ -224,10 +260,10 @@ class RaftApiService {
       onTimeout: () => throw Exception('创建购票单超时（${ _commandTimeout.inSeconds}s），请检查节点连接'),
     );
     if (res.statusCode >= 400) {
-      final body = jsonDecode(res.body) as Map<String, dynamic>;
+      final body = _decodeJsonMap(res, action: '创建购票单');
       throw Exception(body['error'] ?? '创建购票单失败');
     }
-    final body = jsonDecode(res.body) as Map<String, dynamic>;
+    final body = _decodeJsonMap(res, action: '创建购票单');
     Map<String, dynamic>? purchase = body['purchase'] as Map<String, dynamic>?;
     purchase ??= await fetchLatestPendingTicketPurchase(userAddress);
     if (purchase == null || purchase.containsKey('error')) {

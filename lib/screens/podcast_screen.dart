@@ -153,13 +153,13 @@ class _PodcastScreenState extends State<PodcastScreen> {
         margin: const EdgeInsets.symmetric(horizontal: 4),
         child: InkWell(
           onTap: () => context.push('/podcast/room/$id'),
-          child: const Padding(
-            padding: EdgeInsets.all(20),
+          child: Padding(
+            padding: const EdgeInsets.all(20),
             child: Column(
               children: [
-                Icon(Icons.live_tv, color: Colors.red),
-                SizedBox(height: 8),
-                Text('直播间'),
+                const Icon(Icons.live_tv, color: Colors.red),
+                const SizedBox(height: 8),
+                Text('直播间 $id'),
               ],
             ),
           ),

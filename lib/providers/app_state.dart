@@ -31,6 +31,11 @@ import '../services/ximalaya_feed_service.dart';
 import '../utils/wallet_derive.dart';
 
 class AppState extends ChangeNotifier {
+  AppState() {
+    NetworkDebug.onLog = notifyListeners;
+    NetworkDebug.log('App', 'AppState 初始化');
+  }
+
   NodeConfig? _node;
   RaftApiService? _api;
   final WsService ws = WsService();
@@ -50,7 +55,7 @@ class AppState extends ChangeNotifier {
   Map<String, dynamic>? _ticketQuote;
   String? _lastWsEvent;
   final List<ChatMessage> _chatMessages = [];
-  DateTime? _lastChatSentAt;
+  final Map<String, DateTime> _lastChatSentAtByRoom = {};
   bool _loading = false;
   String? _error;
   String? _lastCreatedMnemonic;
@@ -81,11 +86,20 @@ class AppState extends ChangeNotifier {
   String? get lastCreatedMnemonic => _lastCreatedMnemonic;
   String? get lastWsEvent => _lastWsEvent;
   List<ChatMessage> get chatMessages => List.unmodifiable(_chatMessages);
-  List<ChatMessage> get officialChatMessages =>
-      _chatMessages.where((m) => m.room == ChatConfig.officialRoom).toList();
-  int get chatCooldownSeconds => ChatModerationService.cooldownRemaining(_lastChatSentAt);
-  bool get canSendChat => chatCooldownSeconds <= 0;
+  List<ChatMessage> get officialChatMessages => chatMessagesForRoom(ChatConfig.officialRoom);
+
+  List<ChatMessage> chatMessagesForRoom(String room) =>
+      _chatMessages.where((m) => m.room == room).toList();
+
+  int chatCooldownSecondsFor(String room) =>
+      ChatModerationService.cooldownRemaining(_lastChatSentAtByRoom[room]);
+
+  bool canSendChatIn(String room) => chatCooldownSecondsFor(room) <= 0;
+
+  int get chatCooldownSeconds => chatCooldownSecondsFor(ChatConfig.officialRoom);
+  bool get canSendChat => canSendChatIn(ChatConfig.officialRoom);
   bool get wsConnected => ws.isConnected;
+  bool get wsUpstreamReady => ws.upstreamReady;
   String? get wsLastError => ws.lastError;
   String get networkDebugText => NetworkDebug.recentText;
   bool get loading => _loading;
@@ -123,6 +137,27 @@ class AppState extends ChangeNotifier {
   }
 
   int get ticketBalance => _dashboard?.ticketBalance ?? (_user?['ticketBalance'] as num?)?.toInt() ?? 0;
+
+  /// 用户收款地址：服务端已设置 > 钱包地址
+  String? get paymentAddress {
+    final custom = _user?['paymentAddress'] as String?;
+    if (RaftApiService.isTreasuryConfigured(custom)) return custom;
+    final wallet = address;
+    if (wallet != null && wallet.isNotEmpty) return wallet;
+    return null;
+  }
+
+  int get paymentAddressChangesLeft => (_user?['paymentAddressChangesLeft'] as num?)?.toInt() ?? 1;
+
+  Future<void> updatePaymentAddress(String newAddress) async {
+    if (_api == null || address == null) throw Exception('未登录');
+    final trimmed = newAddress.trim();
+    if (!RaftApiService.isTreasuryConfigured(trimmed)) {
+      throw Exception('请输入有效的 TRON 收款地址（T 开头）');
+    }
+    await _api!.setPaymentAddress(userAddress: address!, paymentAddress: trimmed);
+    await refreshAll();
+  }
 
   String get balanceLabel {
     if (_wallet == null) return '—';
@@ -472,6 +507,7 @@ class AppState extends ChangeNotifier {
   /// payMode: self=本机转账 | friend=朋友代付二维码
   Future<Map<String, dynamic>> createTicketPurchase(int qty, {required String payMode}) async {
     if (_api == null || address == null) throw Exception('未登录');
+    await ensureChainRegistered();
     final treasury = _ticketQuote?['treasury'] as String?;
     return _api!.createTicketPurchase(
       userAddress: address!,
@@ -479,6 +515,22 @@ class AppState extends ChangeNotifier {
       payMode: payMode,
       treasuryHint: treasury,
     );
+  }
+
+  /// 购票/排单前确保链上已注册（未注册会导致服务端挂起 → 504 → 二维码出不来）
+  Future<void> ensureChainRegistered() async {
+    if (_api == null || address == null) return;
+    if (_user != null) return;
+    NetworkDebug.log('API', '购票前补注册 $address');
+    try {
+      await _api!.registerUser(userAddress: address!);
+    } catch (e) {
+      NetworkDebug.log('API', '注册请求: $e（可能已存在，继续校验）');
+    }
+    _user = await _api!.fetchUser(address!);
+    if (_user == null) {
+      throw Exception('链上用户未注册，请检查网络后重试（节点设置 → 测速）');
+    }
   }
 
   bool get isTicketTreasuryReady =>
@@ -491,12 +543,19 @@ class AppState extends ChangeNotifier {
     final treasury = purchase['treasury'] as String? ?? PaymentConfig.treasuryAddress;
     final amount = (purchase['payAmount'] as num).toDouble();
 
+    final balance = await ChainRpcService.getBalance(_wallet!.chain, _wallet!.address);
+    final fee = await ChainRpcService.estimateTransferFee(_wallet!.chain, _wallet!.address);
+    final need = amount + fee.fee;
+    if (balance < need) {
+      throw Exception('余额不足：需约 ${need.toStringAsFixed(3)}，当前 ${balance.toStringAsFixed(3)}');
+    }
+
     final txHash = await ChainTransferService.sendPayment(
       chain: _wallet!.chain,
       fromAddress: _wallet!.address,
       toAddress: treasury,
       amount: amount,
-      demoMode: _demoPayments,
+      demoMode: false,
     );
 
     try {
@@ -582,11 +641,35 @@ class AppState extends ChangeNotifier {
     await _connectWs();
   }
 
-  /// 诊断用：单独测 WSS（不改变当前保存的节点）
+  /// 订阅指定聊天室（官方 hall 或 live_a 等），进入页面前调用
+  Future<void> ensureChatRoom(String room) async {
+    NetworkDebug.log('Chat', 'ensureChatRoom($room) connected=${ws.isConnected}');
+    if (_node == null) {
+      NetworkDebug.log('Chat', 'ensureChatRoom 跳过：未配置节点');
+      return;
+    }
+    if (!ws.isConnected) await _connectWs();
+    ws.subscribeChat(room: room);
+    NetworkDebug.log('Chat', '已订阅 chat_$room，房间列表=${ws.chatRoomsLabel}');
+    notifyListeners();
+  }
+
+  Future<void> resubscribeChatRooms() async {
+    NetworkDebug.log('Chat', 'resubscribeChatRooms 房间=${ws.chatRoomsLabel}');
+    if (!ws.isConnected && _node != null) await _connectWs();
+    ws.resubscribeChatRooms();
+    notifyListeners();
+  }
+
+  /// 诊断 WSS；测完后自动恢复当前正式节点连接
   Future<bool> testWs(NodeConfig node) async {
     NetworkDebug.log('UI', '开始 WSS 诊断 ${node.wsUrl}');
     final ok = await ws.connect(node);
     NetworkDebug.log('UI', ok ? 'WSS 诊断通过' : 'WSS 诊断失败: ${ws.lastError}');
+    if (_node != null) {
+      NetworkDebug.log('UI', '诊断结束，恢复正式节点 ${_node!.wsUrl}');
+      await _connectWs();
+    }
     notifyListeners();
     return ok;
   }
@@ -607,6 +690,7 @@ class AppState extends ChangeNotifier {
   void _dispatchWsMessage(Map<String, dynamic> msg) {
     _lastWsEvent = msg['type']?.toString();
     final type = msg['type']?.toString();
+    _logWsInbound(msg);
 
     if (type == 'notification') {
       final topic = msg['topic']?.toString();
@@ -621,14 +705,67 @@ class AppState extends ChangeNotifier {
         case 'chat_messages':
           _ingestChatPayload(data);
           break;
+        default:
+          if (topic != null && topic.startsWith('chat_')) {
+            _ingestChatPayload(data);
+          }
+          break;
       }
     } else if (type == 'chat_message' || type == 'chat_broadcast') {
       _ingestChatPayload(msg);
     } else if (type == 'chat_rejected') {
-      _error = msg['reason']?.toString();
+      final reason = msg['reason']?.toString() ?? '未知';
+      _error = reason;
+      final room = msg['room'] as String? ?? ChatConfig.officialRoom;
+      NetworkDebug.log('Chat', '服务端拒绝 room=$room reason=$reason');
+      _lastChatSentAtByRoom.remove(room);
+      if (_chatMessages.isNotEmpty && _chatMessages.last.id.startsWith('local_')) {
+        _chatMessages.removeLast();
+        NetworkDebug.log('Chat', '已撤回本地乐观消息');
+      }
     }
 
     notifyListeners();
+  }
+
+  void _logWsInbound(Map<String, dynamic> msg) {
+    final type = msg['type']?.toString() ?? '?';
+    if (type == 'notification') {
+      final topic = msg['topic']?.toString() ?? '';
+      if (topic.startsWith('chat_') || topic == 'chat_hall' || topic == 'chat_messages') {
+        final data = msg['data'];
+        if (data is Map<String, dynamic>) {
+          NetworkDebug.log(
+            'WS←',
+            '$topic room=${data['room']} from=${_short(data['sender'])} text=${_short(data['content'])}',
+          );
+        } else if (data is List) {
+          NetworkDebug.log('WS←', '$topic 历史 ${data.length} 条');
+        }
+      }
+      return;
+    }
+    if (type == 'chat_rejected' || type == 'error' || type == 'gateway_connected' || type == 'welcome') {
+      NetworkDebug.log('WS←', '$type ${msg['reason'] ?? msg['error'] ?? msg['upstream'] ?? ''}'.trim());
+    }
+  }
+
+  /// 发送方乐观 local_ 消息与服务端回显去重
+  bool _isLocalEchoOf(ChatMessage local, ChatMessage server) {
+    if (!local.id.startsWith('local_')) return false;
+    if (local.room != server.room || local.content != server.content) return false;
+    if (local.sender == server.sender) return true;
+    final me = address;
+    if (me == null || me.isEmpty) return false;
+    final localIsMe = local.sender == me || local.sender == '我';
+    final serverIsMe = server.sender == me;
+    return localIsMe && serverIsMe;
+  }
+
+  static String _short(dynamic v, [int n = 16]) {
+    final s = v?.toString() ?? '';
+    if (s.length <= n) return s;
+    return '${s.substring(0, n)}…';
   }
 
   void _ingestChatPayload(dynamic payload) {
@@ -646,28 +783,48 @@ class AppState extends ChangeNotifier {
 
   void _appendChatMessage(Map<String, dynamic> json) {
     final msg = ChatMessage.fromJson(json);
-    if (msg.content.isEmpty) return;
-    if (!ChatModerationService.shouldDisplay(msg.content)) return;
-    if (_chatMessages.any((m) => m.id == msg.id)) return;
+    if (msg.content.isEmpty) {
+      NetworkDebug.log('Chat', '丢弃空消息 id=${msg.id}');
+      return;
+    }
+    if (!ChatModerationService.shouldDisplay(msg.content)) {
+      NetworkDebug.log('Chat', '本地过滤不展示: ${_short(msg.content)}');
+      return;
+    }
+    if (!msg.id.startsWith('local_')) {
+      _chatMessages.removeWhere((m) => _isLocalEchoOf(m, msg));
+    }
+    if (_chatMessages.any((m) => m.id == msg.id)) {
+      NetworkDebug.log('Chat', '重复消息 id=${msg.id}');
+      return;
+    }
     _chatMessages.add(msg);
+    NetworkDebug.log(
+      'Chat',
+      '入库 room=${msg.room} from=${_short(msg.sender)} 共${_chatMessages.length}条',
+    );
     if (_chatMessages.length > _maxChatMessages) {
       _chatMessages.removeRange(0, _chatMessages.length - _maxChatMessages);
     }
   }
 
   ChatSendResult sendChatMessage(String content, {String room = ChatConfig.officialRoom}) {
+    NetworkDebug.log(
+      'Chat',
+      '发送 room=$room text=${_short(content)} ws=${ws.isConnected} upstream=${ws.upstreamReady}',
+    );
     final check = ChatModerationService.validateSend(
       content: content,
-      lastSentAt: _lastChatSentAt,
+      lastSentAt: _lastChatSentAtByRoom[room],
     );
     if (!check.ok) {
+      NetworkDebug.log('Chat', '本地校验失败: ${check.reason}');
       notifyListeners();
       return check;
     }
 
     final text = content.trim();
-    _lastChatSentAt = DateTime.now();
-    ws.sendChat(room: room, content: text, sender: address);
+    _lastChatSentAtByRoom[room] = DateTime.now();
     _appendChatMessage({
       'id': 'local_${DateTime.now().millisecondsSinceEpoch}',
       'room': room,
@@ -675,7 +832,12 @@ class AppState extends ChangeNotifier {
       'content': text,
       'at': DateTime.now().millisecondsSinceEpoch,
     });
+    final sent = ws.sendChat(room: room, content: text, sender: address);
+    NetworkDebug.log('Chat', sent ? 'WS→ chat_send 已发出' : 'WS→ chat_send 失败(未连接)');
     notifyListeners();
+    if (!sent) {
+      return ChatSendResult.fail('WSS 未连接，消息仅本地可见');
+    }
     return ChatSendResult.success();
   }
 
@@ -686,6 +848,9 @@ class AppState extends ChangeNotifier {
 
   @override
   void dispose() {
+    if (NetworkDebug.onLog == notifyListeners) {
+      NetworkDebug.onLog = null;
+    }
     _wsSub?.cancel();
     ws.dispose();
     super.dispose();

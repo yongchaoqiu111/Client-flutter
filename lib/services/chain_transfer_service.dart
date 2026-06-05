@@ -6,6 +6,7 @@ import 'package:web3dart/web3dart.dart';
 
 import '../config/chain_config.dart';
 import '../config/payment_config.dart';
+import '../services/tron_transfer_service.dart';
 import '../services/wallet_secrets.dart';
 
 /// 本地签名转账（借鉴 pmsj：私钥不出设备）
@@ -31,7 +32,12 @@ class ChainTransferService {
       return _sendBsc(privateKeyHex: pk, toAddress: toAddress, amountBnb: amount);
     }
     if (chain.toUpperCase() == 'TRON') {
-      throw Exception('TRON 主网完整签名尚未接入，请在「系统设置」开启演示支付，或切换 BSC 钱包');
+      return TronTransferService.sendTrx(
+        privateKeyHex: pk,
+        fromAddress: fromAddress,
+        toAddress: toAddress,
+        amountTrx: amount,
+      );
     }
     throw Exception('不支持的链: $chain');
   }

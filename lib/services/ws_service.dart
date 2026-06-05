@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import '../models/node_config.dart';
 import 'gateway_http_client.dart';
@@ -14,8 +15,12 @@ class WsService {
   bool _connecting = false;
   String? lastError;
   final _messageController = StreamController<Map<String, dynamic>>.broadcast();
+  final Set<String> _chatRooms = {'hall'};
 
   bool get isConnected => _connected && _socket != null;
+  /// 与旧版一致：握手成功即视为可用（不再阻塞等 gateway_connected）
+  bool get upstreamReady => isConnected;
+  String get chatRoomsLabel => _chatRooms.join(',');
 
   Stream<Map<String, dynamic>> get onMessage => _messageController.stream;
 
@@ -79,7 +84,7 @@ class WsService {
         url,
         customClient: client,
         headers: headers,
-      ).timeout(const Duration(seconds: 8));
+      ).timeout(const Duration(seconds: 12));
 
       sw.stop();
       _socket = socket;
@@ -90,20 +95,31 @@ class WsService {
       _sub = socket.listen(
         (data) {
           try {
-            final msg = jsonDecode(data as String) as Map<String, dynamic>;
+            final msg = _parseWsMessage(data);
+            if (msg == null) return;
+            final type = msg['type']?.toString();
+            if (type == 'gateway_connected' || type == 'welcome') {
+              NetworkDebug.log('WSS', '收到 $type，补发订阅');
+              _resubscribeAll();
+            }
             if (!_messageController.isClosed) _messageController.add(msg);
-          } catch (_) {}
+          } catch (e) {
+            NetworkDebug.log('WSS', '消息解析失败: $e type=${data.runtimeType}');
+          }
         },
         onError: (err) {
           lastError = '$err';
           NetworkDebug.log('WSS', '$label onError: $err');
           _drop();
         },
-        onDone: () => _drop(),
+        onDone: () {
+          NetworkDebug.log('WSS', '$label 连接断开');
+          _drop();
+        },
       );
 
-      subscribeReservoir();
-      subscribeChat(room: 'hall');
+      // 恢复旧版：握手成功立即订阅（上一版稳定行为）
+      _resubscribeAll();
       return true;
     } catch (e, st) {
       sw.stop();
@@ -114,6 +130,28 @@ class WsService {
     }
   }
 
+  /// 模拟器/部分机型 WSS 帧为二进制 Uint8ArrayView，不能 data as String
+  static Map<String, dynamic>? _parseWsMessage(dynamic data) {
+    final text = _frameToText(data).trim();
+    if (text.isEmpty) return null;
+    final decoded = jsonDecode(text);
+    if (decoded is Map<String, dynamic>) return decoded;
+    if (decoded is Map) return Map<String, dynamic>.from(decoded);
+    return null;
+  }
+
+  static String _frameToText(dynamic data) {
+    if (data is String) return data;
+    if (data is Uint8List) return utf8.decode(data);
+    if (data is TypedData) {
+      return utf8.decode(
+        data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
+      );
+    }
+    if (data is List<int>) return utf8.decode(List<int>.from(data));
+    return data.toString();
+  }
+
   void _drop() {
     _connected = false;
     _socket = null;
@@ -121,24 +159,44 @@ class WsService {
     _sub = null;
   }
 
-  void subscribe(String topic) => send({'type': 'subscribe', 'topic': topic});
+  void subscribe(String topic) {
+    final ok = send({'type': 'subscribe', 'topic': topic});
+    NetworkDebug.log('WS→', 'subscribe $topic ${ok ? "已发" : "失败"}');
+  }
 
   void subscribeReservoir() => subscribe('reservoir_updates');
 
-  void subscribeChat({String room = 'hall'}) => subscribe('chat_$room');
-
-  void send(Map<String, dynamic> payload) {
-    if (!isConnected) return;
-    _socket?.add(jsonEncode(payload));
+  void subscribeChat({required String room}) {
+    _chatRooms.add(room);
+    subscribe('chat_$room');
   }
 
-  void sendChat({required String room, required String content, String? sender}) {
-    send({
+  void _resubscribeAll() {
+    if (!isConnected) return;
+    subscribeReservoir();
+    for (final room in _chatRooms) {
+      subscribe('chat_$room');
+    }
+  }
+
+  void resubscribeChatRooms() => _resubscribeAll();
+
+  bool send(Map<String, dynamic> payload) {
+    if (!isConnected) return false;
+    _socket?.add(jsonEncode(payload));
+    return true;
+  }
+
+  bool sendChat({required String room, required String content, String? sender}) {
+    final ok = send({
       'type': 'chat_send',
       'room': room,
       'content': content,
       if (sender != null) 'sender': sender,
     });
+    final from = sender == null ? '?' : (sender.length > 10 ? '${sender.substring(0, 10)}…' : sender);
+    NetworkDebug.log('WS→', 'chat_send room=$room from=$from ${ok ? "已发" : "失败"}');
+    return ok;
   }
 
   Future<void> disconnect() async {

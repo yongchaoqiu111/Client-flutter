@@ -5,6 +5,7 @@ import '../config/payment_config.dart';
 import '../providers/app_state.dart';
 import '../widgets/pin_dialog.dart';
 import '../widgets/ticket_payment_dialog.dart';
+import '../widgets/ticket_self_pay_confirm_dialog.dart';
 import '../widgets/ticket_self_pay_dialog.dart';
 
 class TicketPurchaseScreen extends StatefulWidget {
@@ -24,37 +25,71 @@ class _TicketPurchaseScreenState extends State<TicketPurchaseScreen> {
     context.read<AppState>().loadTicketQuote();
   }
 
-  Future<void> _runPurchase(String payMode) async {
-    // 仅本机转账需二级密码；朋友代付不付款，只生成代付单+二维码
-    if (payMode == 'self' && !await showPayPinDialog(context)) return;
+  Future<void> _runSelfPurchase() async {
+    final state = context.read<AppState>();
+    final quote = state.ticketQuote;
+    final treasury = quote?['treasury'] as String? ?? '';
+    final basePrice = (quote?['basePrice'] as num?) ?? 100;
+    final amount = (basePrice * _qty).toDouble();
+    final from = state.address;
+    final chain = state.chain ?? 'TRON';
+
+    if (from == null || from.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先创建或导入钱包')));
+      return;
+    }
+
+    final confirmed = await showTicketSelfPayConfirmDialog(
+      context,
+      fromAddress: from,
+      toAddress: treasury,
+      amount: amount,
+      chain: chain,
+      qty: _qty,
+      demoMode: false,
+    );
+    if (!confirmed || !context.mounted) return;
+
+    if (!await showPayPinDialog(context)) return;
+
+    setState(() => _busy = true);
+    try {
+      final purchase = await state.createTicketPurchase(_qty, payMode: 'self');
+      if (!context.mounted) return;
+      final txHash = await state.payTicketFromDevice(purchase);
+      if (!context.mounted) return;
+      final ok = await showTicketSelfPayDialog(context, purchase: purchase, txHash: txHash);
+      if (!context.mounted) return;
+      if (ok) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('购票成功，排单券已到账')),
+        );
+      }
+    } catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _runFriendPurchase() async {
     setState(() => _busy = true);
     final state = context.read<AppState>();
     try {
-      final purchase = await state.createTicketPurchase(_qty, payMode: payMode);
+      final purchase = await state.createTicketPurchase(_qty, payMode: 'friend');
       if (!context.mounted) return;
-
-      if (payMode == 'self') {
-        final txHash = await state.payTicketFromDevice(purchase);
-        if (!context.mounted) return;
-        final ok = await showTicketSelfPayDialog(context, purchase: purchase, txHash: txHash);
-        if (!context.mounted) return;
-        if (ok) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('购票成功，排单券已到账')),
-          );
-        }
+      final ok = await showTicketPaymentDialog(context, purchase: purchase);
+      if (!context.mounted) return;
+      if (ok) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('购票成功，排单券已到账')),
+        );
       } else {
-        final ok = await showTicketPaymentDialog(context, purchase: purchase);
-        if (!context.mounted) return;
-        if (ok) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('购票成功，排单券已到账')),
-          );
-        } else {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('代付单已创建，好友转账后将自动加券')),
-          );
-        }
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('代付单已创建，好友转账后将自动加券')),
+        );
       }
     } catch (e) {
       if (context.mounted) {
@@ -98,7 +133,7 @@ class _TicketPurchaseScreenState extends State<TicketPurchaseScreen> {
                   ],
                   const SizedBox(height: 8),
                   Text(
-                    '直接购买 → 验二级密码后本机转账；朋友代付 → 直接出金额与二维码。\n'
+                    '直接购买 → 先确认转账信息 → 二级密码 → 本机转账；朋友代付 → 直接出二维码。\n'
                     '查账每 $pollSec 秒，总时限 $timeoutHours 小时。',
                     style: const TextStyle(fontSize: 12, color: Colors.white70, height: 1.4),
                   ),
@@ -123,14 +158,14 @@ class _TicketPurchaseScreenState extends State<TicketPurchaseScreen> {
           ),
           const SizedBox(height: 8),
           FilledButton(
-            onPressed: (_busy || !state.isTicketTreasuryReady) ? null : () => _runPurchase('self'),
+            onPressed: (_busy || !state.isTicketTreasuryReady) ? null : _runSelfPurchase,
             child: _busy
                 ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
                 : const Text('直接购买（本机转账）'),
           ),
           const SizedBox(height: 10),
           OutlinedButton(
-            onPressed: (_busy || !state.isTicketTreasuryReady) ? null : () => _runPurchase('friend'),
+            onPressed: (_busy || !state.isTicketTreasuryReady) ? null : _runFriendPurchase,
             child: const Text('朋友代付（扫码支付）'),
           ),
         ],

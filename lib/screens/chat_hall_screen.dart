@@ -20,12 +20,13 @@ class _ChatHallScreenState extends State<ChatHallScreen> {
   final _input = TextEditingController();
   final _scroll = ScrollController();
   Timer? _cooldownTicker;
+  String? _lastRejectSnack;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      context.read<AppState>().ensureWsConnected();
+      context.read<AppState>().ensureChatRoom(ChatConfig.officialRoom);
     });
     _cooldownTicker = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) setState(() {});
@@ -57,6 +58,14 @@ class _ChatHallScreenState extends State<ChatHallScreen> {
     final state = context.watch<AppState>();
     final messages = state.officialChatMessages;
     final cooldown = state.chatCooldownSeconds;
+    final reject = state.error;
+    if (reject != null && reject != _lastRejectSnack) {
+      _lastRejectSnack = reject;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(reject)));
+      });
+    }
     _scrollToBottom();
 
     return Scaffold(
@@ -66,11 +75,7 @@ class _ChatHallScreenState extends State<ChatHallScreen> {
           children: [
             Text(ChatConfig.officialRoomName, style: const TextStyle(fontSize: 16)),
             Text(
-              state.wsConnected
-                  ? '群聊在线'
-                  : (state.wsLastError != null
-                      ? 'WSS 未连接: ${state.wsLastError}'
-                      : 'WSS 未连接'),
+              _wsStatusLine(state),
               style: TextStyle(
                 fontSize: 11,
                 color: state.wsConnected ? Colors.greenAccent : Colors.orange,
@@ -83,9 +88,14 @@ class _ChatHallScreenState extends State<ChatHallScreen> {
             icon: const Icon(Icons.refresh),
             tooltip: '重连 WSS',
             onPressed: () async {
-              await context.read<AppState>().ensureWsConnected();
+              await context.read<AppState>().resubscribeChatRooms();
               if (context.mounted) setState(() {});
             },
+          ),
+          IconButton(
+            icon: const Icon(Icons.bug_report_outlined),
+            tooltip: '排查日志',
+            onPressed: () => _showDebugSheet(context),
           ),
           IconButton(
             icon: const Icon(Icons.info_outline),
@@ -96,12 +106,6 @@ class _ChatHallScreenState extends State<ChatHallScreen> {
       ),
       body: Column(
         children: [
-          if (!state.wsConnected) ...[
-            const Padding(
-              padding: EdgeInsets.fromLTRB(8, 8, 8, 0),
-              child: NetworkDebugPanel(),
-            ),
-          ],
           Container(
             width: double.infinity,
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -130,8 +134,48 @@ class _ChatHallScreenState extends State<ChatHallScreen> {
                     ),
                   ),
           ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: NetworkDebugPanel(
+              title: '群聊排查日志',
+              compact: true,
+              initiallyExpanded: !state.wsConnected,
+            ),
+          ),
           _inputBar(context, state, cooldown),
         ],
+      ),
+    );
+  }
+
+  String _wsStatusLine(AppState state) {
+    if (!state.wsConnected) {
+      return state.wsLastError != null ? 'WSS 未连接: ${state.wsLastError}' : 'WSS 未连接';
+    }
+    return '群聊在线 · ${state.officialChatMessages.length} 条';
+  }
+
+  void _showDebugSheet(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.55,
+        minChildSize: 0.35,
+        maxChildSize: 0.85,
+        builder: (_, scroll) => Padding(
+          padding: const EdgeInsets.all(12),
+          child: ListView(
+            controller: scroll,
+            children: const [
+              NetworkDebugPanel(
+                title: '群聊/WSS 全链路日志',
+                hint: '复制整段日志发给我，可精确定位订阅/收发问题',
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -168,14 +212,20 @@ class _ChatHallScreenState extends State<ChatHallScreen> {
 
   void _send(BuildContext context) {
     final text = _input.text;
-    final result = context.read<AppState>().sendChatMessage(text);
-    if (!result.ok) {
+    try {
+      final result = context.read<AppState>().sendChatMessage(text);
+      if (!result.ok) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(result.reason ?? '发送失败')),
+        );
+        return;
+      }
+      _input.clear();
+    } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(result.reason ?? '发送失败')),
+        SnackBar(content: Text('发送异常: $e')),
       );
-      return;
     }
-    _input.clear();
   }
 
   void _showRules(BuildContext context) {
