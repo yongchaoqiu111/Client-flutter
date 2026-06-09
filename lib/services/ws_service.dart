@@ -166,6 +166,8 @@ class WsService {
 
   void subscribeReservoir() => subscribe('reservoir_updates');
 
+  void subscribePoolCheckpoint() => subscribe('pool_checkpoint');
+
   void subscribeChat({required String room}) {
     _chatRooms.add(room);
     subscribe('chat_$room');
@@ -174,6 +176,7 @@ class WsService {
   void _resubscribeAll() {
     if (!isConnected) return;
     subscribeReservoir();
+    subscribePoolCheckpoint();
     for (final room in _chatRooms) {
       subscribe('chat_$room');
     }

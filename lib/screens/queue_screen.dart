@@ -35,6 +35,11 @@ class QueueScreen extends StatelessWidget {
               '档位金额已内置，无需联网即可选档；提交排单时才连接节点',
               style: TextStyle(color: Colors.white38, fontSize: 12),
             ),
+            const SizedBox(height: 8),
+            OutlinedButton(
+              onPressed: () => context.push('/pool/queue'),
+              child: const Text('链上排单（买券即排队 · 方案A）'),
+            ),
             if (state.error != null) ...[
               const SizedBox(height: 8),
               Text(state.error!, style: const TextStyle(color: Colors.orange, fontSize: 12)),

@@ -20,6 +20,7 @@ import '../screens/rewards_screen.dart';
 import '../screens/security_screen.dart';
 import '../screens/settings_screen.dart';
 import '../screens/shell_screen.dart';
+import '../screens/pool_queue_screen.dart';
 import '../screens/ticket_purchase_screen.dart';
 import '../models/queue_tier.dart';
 import '../screens/wallet_management_screen.dart';
@@ -59,6 +60,7 @@ GoRouter createAppRouter() {
         builder: (_, state) => OrderDetailScreen(orderId: state.pathParameters['id']!),
       ),
       GoRoute(path: '/ticket', builder: (_, __) => const TicketPurchaseScreen()),
+      GoRoute(path: '/pool/queue', builder: (_, __) => const PoolQueueScreen()),
       GoRoute(path: '/me/wallet', builder: (_, __) => const WalletManagementScreen()),
       GoRoute(path: '/me/security', builder: (_, __) => const SecurityScreen()),
       GoRoute(path: '/me/payment-address', builder: (_, __) => const PaymentAddressScreen()),

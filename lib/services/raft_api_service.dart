@@ -103,6 +103,23 @@ class RaftApiService {
     );
   }
 
+  /// 统一计算截取高度（网关固定转发 node1，多 WSS 结果一致）
+  Future<Map<String, dynamic>?> fetchPoolCheckpoint() async {
+    final res = await _get('/api/pool/checkpoint');
+    if (res.statusCode == 503) return null;
+    if (res.statusCode != 200) {
+      throw Exception('获取 pool checkpoint 失败 HTTP ${res.statusCode}');
+    }
+    final body = jsonDecode(res.body) as Map<String, dynamic>;
+    return body['checkpoint'] as Map<String, dynamic>?;
+  }
+
+  Future<Map<String, dynamic>> fetchPoolConfig() async {
+    final res = await _get('/api/pool/config');
+    if (res.statusCode != 200) throw Exception('获取 pool config 失败');
+    return jsonDecode(res.body) as Map<String, dynamic>;
+  }
+
   Future<List<QueueTier>> fetchTiers() async {
     final res = await _get('/api/tiers');
     if (res.statusCode != 200) throw Exception('获取档位失败');
