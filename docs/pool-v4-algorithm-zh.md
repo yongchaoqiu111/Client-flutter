@@ -2,7 +2,9 @@
 
 > **规则版本**：`pool-v4-dual-pool`  
 > **参考实现（本仓库）**：[`lib/services/pool_engine_service.dart`](../lib/services/pool_engine_service.dart)、[`lib/config/pool_rules_config.dart`](../lib/config/pool_rules_config.dart)、[`lib/services/exit_pay_verify.dart`](../lib/services/exit_pay_verify.dart)  
-> **英文版**：[pool-v4-algorithm-en.md](./pool-v4-algorithm-en.md)
+> **英文版**：[pool-v4-algorithm-en.md](./pool-v4-algorithm-en.md)  
+> **官方发展沙盘（最稳路线）**：[stable-growth-roadmap-zh.md](./stable-growth-roadmap-zh.md)  
+> **每日护盘/提速执行**：[million-member-ops-playbook-zh.md](./million-member-ops-playbook-zh.md)
 
 ---
 
@@ -54,18 +56,27 @@ TRjvctzrc5WcEeu2UrT8mV5H6zW8dCgimR
 
 ---
 
-## 3. 档位配置（以 3000 档为例）
+## 3. 档位配置（与排单商城出场比例一致）
 
-| 字段 | 值 | 含义 |
-|------|-----|------|
-| `ticketPriceTrx` | 100 | 买券实付 TRX |
-| `poolCreditTrx` | 3,000 | 计入资金池额度 |
-| `poolTargetTrx` | 300,000 | 池满阈值 |
-| `exitAmountTrx` | 3,900 | 单次出场应收 TRX |
-| `purchaseAddress` | 链上配置 | 买券收款地址 |
-| `exitPoolAddress` | 见上 | 出场应付地址 |
+**算法相同**，每档独立资金池，仅参数不同。详见 `lib/config/pool_rules_config.dart` 中 `kPoolTiers`。
 
-30000 档、30 万档按相同比例放大，详见 `lib/config/pool_rules_config.dart` 中 `kPoolTiers`。
+| 档位 | 进场实付 | 入池额度 | 池满阈值 | 出场额 | 收益率 |
+|------|----------|----------|----------|--------|--------|
+| 小额 | 100 | 1,000 | 100,000 | 1,300 | 30% |
+| 中额 | 1,000 | 10,000 | 1,000,000 | 12,000 | 20% |
+| 大额 | 5,000 | 100,000 | 10,000,000 | 110,000 | 10% |
+| 超大额 | 50,000 | 1,000,000 | 100,000,000 | 1,080,000 | 8% |
+
+池满阈值 = `poolCreditTrx × 100`（与旧「100 笔满池」结构相同）。
+
+| 字段 | 含义 |
+|------|------|
+| `ticketPriceTrx` | 链上进场实付 TRX |
+| `poolCreditTrx` | 计入本档资金池（排单额） |
+| `poolTargetTrx` | 本档池满才可匹配溢出 |
+| `exitAmountTrx` | 收款池 recv_out 整数单位 |
+| `purchaseAddress` | 本档进场收款地址 |
+| `exitPoolAddress` | 出场池（各档共用） |
 
 ---
 
@@ -88,7 +99,7 @@ TRjvctzrc5WcEeu2UrT8mV5H6zW8dCgimR
 | 状态 | 池 | 含义 |
 |------|-----|------|
 | `pay_queued` | 打款池 | 买券成功，排队等待被选为付款方 |
-| `pay_pending` | 打款池 | 已生成 pay_in 任务，待付至出场池 |
+| `pay_pending` | 打款池 | 已生成 pay_in 任务，待付至出场池（含转单后待新 `payer` 付款） |
 | `pay_expired` | 归档 | 出场打款超时，不再参与匹配 |
 | `recv_queued` | 收款池 | 主网验款通过，等待 recv_out 分配 |
 | `recv_partial` | 收款池 | 零头未凑满 exitAmount，次日继续 |
@@ -158,9 +169,31 @@ ledgerBalance = Σ(非 blocked/pay_expired/done 的 poolCreditTrx) − Σ(历史
 对状态为 `pay_pending` 的订单，用 `exitPoolTxs` 在 `[matchAtMs, evaluationMs]` 窗口内验款：
 
 - 全部 pay_in 任务命中 → `recv_queued`，记录 `verifiedMainnetTxId`
-- 超过 `deadlineMs` 仍未付清 → `pay_expired`
+- 超过 **本级** `deadlineMs` 仍未付清 → 进入 **步骤 3 补充（转单）**，而非立即 `pay_expired`
+- 转单链全部走完仍无到账 → `pay_expired`
 
 验款规则见第 9 节。
+
+### 步骤 3 补充 — 付款超时转单
+
+**铁律：谁付谁收，认准链上地址。**
+
+- 任务当前 **`pay_in.payer`** 是谁，主网只接受 **`fromAddress` = 该地址** 的出场池入账
+- **转单**更新 `payer` 与 `deadlineMs`；转单前旧地址的迟付 **不计入** 本任务
+- 付清后，原 **中标 entry**（`payerEntryId`）→ `recv_queued`；付款义务可转嫁，排队顺位不变
+
+固定转单链（每级 **24h**，`payerLevel` 0→3）：
+
+| payerLevel | 当前 `pay_in.payer` | 本级 24h 未付 → |
+|------------|---------------------|-----------------|
+| 0 | 中标会员地址 | 转 **直推上级** 地址 |
+| 1 | 直推上级地址 | 转 **服务中心** 地址 |
+| 2 | 服务中心地址 | 转 **平台兜底** 地址 |
+| 3 | 平台兜底地址 | 仍无到账 → **`pay_expired`** |
+
+状态：`timeout_transferred`（已转单，待新 `payer` 付款）。
+
+运营细则见 [稳定路线图 §14.8](stable-growth-roadmap-zh.md#148-付款转单链会员--上级--服务中心--我方最终不收不到款)。
 
 ### 步骤 4 — 若 `canMatch`，生成匹配
 
@@ -208,13 +241,13 @@ matchedCreditTrx = Σ(pay_in.amountTrx) + Σ(ticket_surplus.amountTrx)
 
 | 条件 | 要求 |
 |------|------|
-| 付款地址 | `fromAddress` = 任务 `payer` |
+| 付款地址 | `fromAddress` = 任务 **当前** `payer`（转单后以新地址为准；**谁付谁收**） |
 | 收款地址 | `toAddress` = `exitPoolAddress`（若链上带 to） |
 | 金额 | 与 `amountTrx` 一致（4 位小数） |
 | 时间 | `matchAtMs <= blockTimestamp <= evaluationMs` |
 | 去重 | 每笔链上 tx 全局仅用一次 |
 
-全部任务命中 → 验款通过；任一时间超过 `deadlineMs` 且未付清 → `pay_expired`。
+全部任务命中 → 验款通过。超过 **本级** `deadlineMs` 未付清 → 按步骤 3 补充 **转单**；`payerLevel` = 3 仍失败 → `pay_expired`。
 
 **不使用**测试网、用户手动提交的 tx 哈希或 WSS 推送作为验款依据。
 
@@ -247,7 +280,7 @@ import 'package:mmm_client/services/pool_engine_service.dart';
 
 final engine = PoolEngineService();
 final result = engine.runPoolCycle(
-  poolId: '3000',
+  poolId: '1000',
   purchaseTxs: purchaseTxs,
   exitPoolTxs: exitPoolTxs,
   snapshot: savedSnapshot, // 可选
@@ -255,7 +288,14 @@ final result = engine.runPoolCycle(
 );
 ```
 
-App 内由 `PoolMatcherService.runFullMatcher()` 自动拉 TronGrid 并持久化 `result.snapshot`。
+App 内由 `PoolMatcherService.runFullMatcher()` 拉 TronGrid 并持久化 `result.snapshot`。
+
+**规模化读取（已实现）**：
+
+1. **用户自备 TronGrid API Key**（设置页）→ 请求头 `TRON-PRO-API-KEY`，避免公共限额。
+2. **本地 tx 缓存 + 增量拉取**：`PoolTxCacheStore` 按地址缓存已拉转账；下次仅 `min_timestamp=末笔+1` 拉新增，与池快照增量回放配合，避免每次从 0 翻页。
+3. 异常时可「清除排单链上缓存」全量重拉。
+4. **平台快照**：`WSS-server/shared/publish-pool-snapshot.js` 与客户端同 `pool-rules.js`，统一 `checkpointCutoffMs` + `tronBlock` → 静态 `snapshot.json` 部署 Vercel；App 配置 `POOL_SNAPSHOT_URL` 优先下载，本人付款仍用用户 Key 核验。
 
 返回（节选）：
 

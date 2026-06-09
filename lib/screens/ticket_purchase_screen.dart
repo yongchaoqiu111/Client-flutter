@@ -124,6 +124,15 @@ class _TicketPurchaseScreenState extends State<TicketPurchaseScreen> {
                   Text('本机转账：${selfPay.toStringAsFixed(0)} TRX（整数，按钱包+收款+到账验链）'),
                   Text('朋友代付：含唯一尾数金额 + 二维码', style: const TextStyle(fontSize: 12, color: Colors.white54)),
                   Text('收款: ${quote?['treasury'] ?? '—'}', style: const TextStyle(fontSize: 12)),
+                  const SizedBox(height: 8),
+                  Text(
+                    state.address != null && state.address!.isNotEmpty
+                        ? '用哪个地址购买，就用哪个地址排单。本机转账将记在当前钱包：'
+                        ' ${state.address!.substring(0, 6)}…${state.address!.substring(state.address!.length - 4)}；'
+                        '朋友代付则记在实际转账的钱包地址。'
+                        : '用哪个地址购买，就用哪个地址排单。本机转账记当前钱包；朋友代付记实际付款地址。',
+                    style: const TextStyle(fontSize: 12, color: Colors.cyanAccent, height: 1.45),
+                  ),
                   if (!state.isTicketTreasuryReady) ...[
                     const SizedBox(height: 8),
                     const Text(

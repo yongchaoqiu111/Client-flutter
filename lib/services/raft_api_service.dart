@@ -175,6 +175,26 @@ class RaftApiService {
     );
   }
 
+  /// 推荐人绑定：仅可提交一次（服务端拒绝重复绑定）
+  Future<void> bindReferrer({
+    required String userAddress,
+    required String parentAddress,
+  }) async {
+    await submitCommand(
+      {
+        'type': 'BIND_REFERRER',
+        'userAddress': userAddress,
+        'parentAddress': parentAddress,
+      },
+      signerAddress: userAddress,
+    );
+  }
+
+  Future<Map<String, dynamic>> fetchTransferChain(String address) async {
+    final res = await _get('/api/user/$address/transfer-chain');
+    return jsonDecode(res.body) as Map<String, dynamic>;
+  }
+
   Future<void> registerUser({
     required String userAddress,
     String? parentAddress,

@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 import '../config/queue_tiers_presets.dart';
 import '../models/queue_tier.dart';
 import '../providers/app_state.dart';
+import '../widgets/trongrid_api_key_onboarding.dart';
 
 class QueueScreen extends StatelessWidget {
   const QueueScreen({super.key});
@@ -26,13 +27,16 @@ class QueueScreen extends StatelessWidget {
         child: ListView(
           padding: const EdgeInsets.all(16),
           children: [
+            const TronGridApiKeyBanner(
+              reason: '进入排单：查看链上大盘无需 Key；付出场池、验本人链上状态须先配置 TronGrid API Key。',
+            ),
             Text(
               '排单券余额：${state.ticketBalance} 张 · 票价 ${QueueTiersPresets.ticketPriceTrx} TRX/张',
               style: const TextStyle(color: Colors.white54),
             ),
             const SizedBox(height: 4),
             const Text(
-              '档位金额已内置，无需联网即可选档；提交排单时才连接节点',
+              '档位金额已内置；链上排单读平台快照看队，付款验款用个人 Key。',
               style: TextStyle(color: Colors.white38, fontSize: 12),
             ),
             const SizedBox(height: 8),

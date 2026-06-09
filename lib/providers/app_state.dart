@@ -25,6 +25,8 @@ import '../services/gateway_probe_service.dart';
 import '../services/network_debug.dart';
 import '../services/node_config_service.dart';
 import '../services/raft_api_service.dart';
+import '../services/pool_matcher_service.dart';
+import '../services/pool_tx_cache_store.dart';
 import '../services/wallet_service.dart';
 import '../services/ws_service.dart';
 import '../services/ximalaya_feed_service.dart';
@@ -61,10 +63,12 @@ class AppState extends ChangeNotifier {
   String? _lastCreatedMnemonic;
   int _shellTabIndex = 0;
   Map<String, dynamic>? _network;
+  Map<String, dynamic>? _transferChain;
   Map<String, dynamic>? _performance;
   Map<String, dynamic>? _burnRewards;
   AnchorStatus? _anchorStatus;
   bool _demoPayments = PaymentConfig.demoPaymentsDefault;
+  String? _tronGridApiKey;
   PodcastAlbum? _podcastAlbum;
   bool _podcastLoading = false;
   String? _podcastError;
@@ -107,10 +111,19 @@ class AppState extends ChangeNotifier {
   double? get nativeBalance => _nativeBalance;
   int get shellTabIndex => _shellTabIndex;
   Map<String, dynamic>? get network => _network;
+  Map<String, dynamic>? get transferChain => _transferChain;
+  String? get parentAddress => _user?['parentAddress'] as String?;
+  bool get hasBoundReferrer =>
+      parentAddress != null && parentAddress!.trim().isNotEmpty;
   Map<String, dynamic>? get performance => _performance;
   Map<String, dynamic>? get burnRewards => _burnRewards;
   AnchorStatus? get anchorStatus => _anchorStatus;
   bool get demoPayments => _demoPayments;
+  String? get tronGridApiKey => _tronGridApiKey;
+  bool get hasTronGridApiKey => _tronGridApiKey != null && _tronGridApiKey!.isNotEmpty;
+
+  PoolMatcherService createPoolMatcher() =>
+      PoolMatcherService(tronGridApiKey: _tronGridApiKey);
   PodcastAlbum? get podcastAlbum => _podcastAlbum;
   bool get podcastLoading => _podcastLoading;
   String? get podcastError => _podcastError;
@@ -371,6 +384,11 @@ class AppState extends ChangeNotifier {
       _user = await _api!.fetchUser(address!);
       _orders = await _api!.fetchOrders(address!);
       _network = await _api!.fetchNetwork(address!);
+      try {
+        _transferChain = await _api!.fetchTransferChain(address!);
+      } catch (_) {
+        _transferChain = null;
+      }
       _performance = await _api!.fetchPerformance(address!);
       _burnRewards = await _api!.fetchBurnRewards(address!);
       try {
@@ -392,7 +410,52 @@ class AppState extends ChangeNotifier {
   Future<void> refreshUser() async {
     if (_api == null || address == null) return;
     _user = await _api!.fetchUser(address!);
+    try {
+      _transferChain = await _api!.fetchTransferChain(address!);
+    } catch (_) {}
     notifyListeners();
+  }
+
+  /// 关系页推荐人绑定（仅一次，服务端不可改）
+  Future<void> bindReferrer(String parentRaw) async {
+    if (_api == null || address == null) throw Exception('请先连接节点');
+    if (hasBoundReferrer) throw Exception('推荐人已绑定，不可修改');
+    final parent = _parseReferrerAddress(parentRaw);
+    if (parent == null) throw Exception('请输入有效的 TRON 推荐人地址');
+    if (parent == address) throw Exception('不能绑定自己');
+    _loading = true;
+    _error = null;
+    notifyListeners();
+    try {
+      await _api!.bindReferrer(userAddress: address!, parentAddress: parent);
+      await refreshUser();
+      _network = await _api!.fetchNetwork(address!);
+    } finally {
+      _loading = false;
+      notifyListeners();
+    }
+  }
+
+  String? _parseReferrerAddress(String raw) {
+    final s = raw.trim();
+    if (s.startsWith('T') && s.length >= 30) return s;
+    final m = RegExp(r'[T][A-HJ-NP-Za-km-z1-9]{33}').firstMatch(s);
+    return m?.group(0);
+  }
+
+  /// 从本钱包向出场池打款（pay_in 任务）
+  Future<String> payExitPoolAssignment({
+    required String toAddress,
+    required double amountTrx,
+  }) async {
+    if (_wallet == null) throw Exception('请先创建钱包');
+    return ChainTransferService.sendPayment(
+      chain: _wallet!.chain,
+      fromAddress: _wallet!.address,
+      toAddress: toAddress,
+      amount: amountTrx,
+      demoMode: _demoPayments,
+    );
   }
 
   /// 排单页下拉刷新：只更新用户/订单数据，档位用内置预算
@@ -483,6 +546,19 @@ class AppState extends ChangeNotifier {
   Future<void> setDemoPayments(bool value) async {
     _demoPayments = value;
     await AppSettingsService.setDemoPayments(value);
+    notifyListeners();
+  }
+
+  Future<void> setTronGridApiKey(String? value) async {
+    final trimmed = value?.trim();
+    _tronGridApiKey = (trimmed == null || trimmed.isEmpty) ? null : trimmed;
+    await AppSettingsService.setTronGridApiKey(_tronGridApiKey);
+    notifyListeners();
+  }
+
+  /// 排单链上缓存异常时：清空本地 tx 缓存，下次刷新将全量重拉
+  Future<void> clearPoolTxCache() async {
+    await PoolTxCacheStore.clearAll();
     notifyListeners();
   }
 

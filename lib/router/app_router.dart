@@ -19,6 +19,7 @@ import '../screens/pin_setup_screen.dart';
 import '../screens/rewards_screen.dart';
 import '../screens/security_screen.dart';
 import '../screens/settings_screen.dart';
+import '../screens/trongrid_api_key_screen.dart';
 import '../screens/shell_screen.dart';
 import '../screens/pool_queue_screen.dart';
 import '../screens/ticket_purchase_screen.dart';
@@ -80,6 +81,7 @@ GoRouter createAppRouter() {
       GoRoute(path: '/me/rewards', builder: (_, __) => const RewardsScreen()),
       GoRoute(path: '/help', builder: (_, __) => const HelpScreen()),
       GoRoute(path: '/settings', builder: (_, __) => const SettingsScreen()),
+      GoRoute(path: '/settings/trongrid-key', builder: (_, __) => const TronGridApiKeyScreen()),
     ],
   );
 }

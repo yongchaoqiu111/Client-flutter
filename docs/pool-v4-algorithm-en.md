@@ -54,18 +54,18 @@ TRjvctzrc5WcEeu2UrT8mV5H6zW8dCgimR
 
 ---
 
-## 3. Tier configuration (3000 tier example)
+## 3. Tier configuration (aligned with legacy queue profit rates)
 
-| Field | Value | Meaning |
-|-------|-------|---------|
-| `ticketPriceTrx` | 100 | TRX paid to buy a ticket |
-| `poolCreditTrx` | 3,000 | Credit added to the pool ledger |
-| `poolTargetTrx` | 300,000 | Pool fill threshold |
-| `exitAmountTrx` | 3,900 | TRX received per exit slot |
-| `purchaseAddress` | On-chain config | Ticket purchase address |
-| `exitPoolAddress` | See above | Exit payment destination |
+**Same algorithm**; each tier is an independent pool with different parameters. See `kPoolTiers` in `lib/config/pool_rules_config.dart`.
 
-Tiers 30000 and 300000 scale proportionally; see `kPoolTiers` in `lib/config/pool_rules_config.dart`.
+| Tier | Entry pay | Pool credit | Pool target | Exit | Profit |
+|------|-----------|-------------|-------------|------|--------|
+| Small | 100 | 1,000 | 100,000 | 1,300 | 30% |
+| Medium | 1,000 | 10,000 | 1,000,000 | 12,000 | 20% |
+| Large | 5,000 | 100,000 | 10,000,000 | 110,000 | 10% |
+| Super | 50,000 | 1,000,000 | 100,000,000 | 1,080,000 | 8% |
+
+Pool target = `poolCreditTrx × 100` (same “100 entries fill the pool” structure as before).
 
 ---
 
@@ -248,7 +248,7 @@ import 'package:mmm_client/services/pool_engine_service.dart';
 
 final engine = PoolEngineService();
 final result = engine.runPoolCycle(
-  poolId: '3000',
+  poolId: '1000',
   purchaseTxs: purchaseTxs,
   exitPoolTxs: exitPoolTxs,
   snapshot: savedSnapshot, // optional

@@ -1,172 +1,140 @@
 import 'package:flutter/material.dart';
-
 import 'package:flutter/services.dart';
-
 import 'package:provider/provider.dart';
 
-
-
 import '../config/pool_rules_config.dart';
-
 import '../models/pool_cycle_models.dart';
-
 import '../providers/app_state.dart';
-
-import '../services/pool_matcher_service.dart';
 import '../utils/tron_address_util.dart';
+import '../widgets/trongrid_api_key_gate.dart';
+import '../widgets/trongrid_api_key_onboarding.dart';
 
-
-
-/// 无服务器排单：花 ticketPrice 买券 → 计 poolCredit 入池；拆分匹配出场
-
+/// 链上排单：平台快照看大盘；本人付款/验款须 TronGrid Key
 class PoolQueueScreen extends StatefulWidget {
-
   const PoolQueueScreen({super.key});
 
-
-
   @override
-
   State<PoolQueueScreen> createState() => _PoolQueueScreenState();
-
 }
 
-
-
 class _PoolQueueScreenState extends State<PoolQueueScreen> {
-
   bool _loading = false;
-
   String? _error;
-
   Map<String, PoolCycleResult>? _pools;
-
   PoolTierConfig? _selectedTier;
+  String? _snapshotMeta;
 
-  final PoolMatcherService _matcher = PoolMatcherService();
+  Future<void> _refreshSnapshot() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final matcher = context.read<AppState>().createPoolMatcher();
+      final result = await matcher.runMatcher();
+      if (!mounted) return;
+      setState(() {
+        _pools = result.pools;
+        _snapshotMeta = result.isRemoteSnapshot
+            ? '平台快照${_shortHash(result.contentHash)}'
+            : '本地 TronGrid 回放';
+      });
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
 
-
-
-  Future<void> _refresh() async {
+  Future<void> _refreshChainVerify() async {
+    final ok = await ensureTronGridApiKey(
+      context,
+      actionTitle: '刷新链上验款',
+      message: '将用您的 TronGrid Key 拉取链上转账并重新验款，确认本人是否已付出场池。',
+    );
+    if (!ok || !mounted) return;
 
     setState(() {
-
       _loading = true;
-
       _error = null;
-
     });
-
     try {
-
-      final pools = await _matcher.runFullMatcher();
-
+      final matcher = context.read<AppState>().createPoolMatcher();
+      final result = await matcher.runChainVerify();
       if (!mounted) return;
-
-      setState(() => _pools = pools);
-
+      setState(() {
+        _pools = result.pools;
+        _snapshotMeta = '链上验款（本地回放）';
+      });
     } catch (e) {
-
       if (mounted) setState(() => _error = '$e');
-
     } finally {
-
       if (mounted) setState(() => _loading = false);
-
     }
-
   }
 
-
-
   @override
-
   void initState() {
-
     super.initState();
-
-    WidgetsBinding.instance.addPostFrameCallback((_) => _refresh());
-
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _refreshSnapshot();
+    });
   }
 
-
-
   @override
-
   Widget build(BuildContext context) {
-
     final state = context.watch<AppState>();
-
     final me = state.address;
-
     final matchCtx = PoolRulesConfig.dailyMatchContext();
 
-
-
     return Scaffold(
-
       appBar: AppBar(
-
         title: const Text('链上排单（买券即排队）'),
-
         actions: [
-
-          IconButton(icon: const Icon(Icons.refresh), onPressed: _loading ? null : _refresh),
-
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: _loading ? null : _refreshSnapshot,
+          ),
         ],
-
       ),
-
       body: RefreshIndicator(
-
-        onRefresh: _refresh,
-
+        onRefresh: _refreshSnapshot,
         child: ListView(
-
           padding: const EdgeInsets.all(16),
-
           children: [
-
-            _infoCard(matchCtx),
-
-            if (_error != null)
-
+            const TronGridApiKeyBanner(),
+            if (_snapshotMeta != null)
               Padding(
-
-                padding: const EdgeInsets.only(bottom: 12),
-
-                child: Text(_error!, style: const TextStyle(color: Colors.orange)),
-
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Text(
+                  '数据来源：$_snapshotMeta',
+                  style: const TextStyle(fontSize: 11, color: Colors.cyan),
+                ),
               ),
-
+            _infoCard(matchCtx),
+            if (_error != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Text(_error!, style: const TextStyle(color: Colors.orange)),
+              ),
             if (_loading && _pools == null)
-
-              const Center(child: Padding(padding: EdgeInsets.all(24), child: CircularProgressIndicator())),
-
-            ...kPoolTiers.map((tier) => _tierSection(tier)),
-
-            if (_pools != null && me != null) _myStatus(me),
-
+              const Center(
+                child: Padding(padding: EdgeInsets.all(24), child: CircularProgressIndicator()),
+              ),
+            ...kPoolTiers.map(_tierSection),
+            if (_pools != null && me != null) _myStatus(context, me),
             const SizedBox(height: 24),
-
             const Text(
-              '规则 v4：买券 → 打款池排队；池满 30 万且满 15 天后，每日 08:00 将溢出额度'
-              '生成 pay_in 任务付至出场池；主网验款通过 → 收款池；收款池按 3900 整数 recv_out，'
-              '零头 recv_partial 或打排单券地址。点「刷新链上状态」仅查 TronGrid，无需自报 anchor。',
+              '规则 v4：支付进场 → 打款池；本档池满且满 15 天后，每日 08:00 匹配溢出；'
+              'pay_in 付出场池 → 主网验款 → 收款池。付款钱包即排单身份。'
+              '看队读平台快照；付钱、验款认链上 tx（须个人 TronGrid Key）。',
               style: TextStyle(fontSize: 11, color: Colors.white54, height: 1.4),
             ),
-
           ],
-
         ),
-
       ),
-
     );
-
   }
-
-
 
   Widget _infoCard(DailyMatchContext matchCtx) {
     final next = DateTime.fromMillisecondsSinceEpoch(matchCtx.nextMatchAtMs, isUtc: true).toLocal();
@@ -197,64 +165,39 @@ class _PoolQueueScreenState extends State<PoolQueueScreen> {
     );
   }
 
-
-
   Widget _tierSection(PoolTierConfig tier) {
-
     final result = _pools?[tier.id];
-
     final fill = result?.fill;
-
     final isSelected = _selectedTier?.id == tier.id;
 
-
-
     return Card(
-
       margin: const EdgeInsets.only(bottom: 12),
-
       child: Padding(
-
         padding: const EdgeInsets.all(14),
-
         child: Column(
-
           crossAxisAlignment: CrossAxisAlignment.start,
-
           children: [
-
             Text(tier.name, style: Theme.of(context).textTheme.titleMedium),
-
             Text(
-
-              '付 ${tier.ticketPriceTrx.toStringAsFixed(0)} TRX 买券 → 计 ${tier.poolCreditTrx.toStringAsFixed(0)} 入池',
-
+              '付 ${tier.ticketPriceTrx.toStringAsFixed(0)} TRX 进场 → 计 ${tier.poolCreditTrx.toStringAsFixed(0)} 入池',
               style: const TextStyle(fontSize: 12),
-
             ),
-
-            Text('出场应收 ${tier.exitAmountTrx.toStringAsFixed(0)} TRX', style: const TextStyle(fontSize: 12, color: Colors.white54)),
-
+            Text(
+              '排单 ${tier.poolCreditTrx.toStringAsFixed(0)} → 出场 ${tier.exitAmountTrx.toStringAsFixed(0)} TRX'
+              '（收益 ${(tier.profitRate * 100).toStringAsFixed(0)}%）',
+              style: const TextStyle(fontSize: 12, color: Colors.white54),
+            ),
             const SizedBox(height: 8),
-
             SelectableText('买券地址：${tier.purchaseAddress}', style: const TextStyle(fontSize: 11)),
             SelectableText('出场池地址：${tier.exitPoolAddress}', style: const TextStyle(fontSize: 11, color: Colors.cyan)),
-
             if (fill != null) ...[
-
               const SizedBox(height: 8),
-
               Text(
-
                 '池 ${fill.totalPoolCreditTrx.toStringAsFixed(0)} / ${fill.targetTrx.toStringAsFixed(0)}'
                 '${(fill.overflowPoolCreditTrx ?? 0) > 0 ? ' · 今日可匹配溢出 ${fill.overflowPoolCreditTrx!.toStringAsFixed(0)}' : ''} · '
-
                 '${fill.entryCount} 笔 · 已积累 ${fill.daysSinceFirstEntry} 天',
-
                 style: const TextStyle(fontSize: 12),
-
               ),
-
               Text(
                 fill.canMatch
                     ? '✓ 今日可匹配（池满且满 ${PoolRulesConfig.entryPeriodDays} 天）'
@@ -275,70 +218,36 @@ class _PoolQueueScreenState extends State<PoolQueueScreen> {
                   '收款池 ${result.recvPoolCount} 人',
                   style: const TextStyle(fontSize: 11, color: Colors.cyan),
                 ),
-              if (result.remainderToReceiverTrx > 0)
-                Text(
-                  '零头 ${result.remainderToReceiverTrx.toStringAsFixed(0)} 排给下一位收款'
-                  '（凑满 3900 明日继续）',
-                  style: const TextStyle(fontSize: 11, color: Colors.amber),
-                ),
-              if (result.ticketRemainderTrx > 0)
-                Text(
-                  '零头 ${result.ticketRemainderTrx.toStringAsFixed(0)} 打排单券地址',
-                  style: const TextStyle(fontSize: 11, color: Colors.amber),
-                ),
-
             ],
-
             const SizedBox(height: 10),
-
             Row(
-
               children: [
-
                 TextButton(
-
                   onPressed: () {
-
                     Clipboard.setData(ClipboardData(text: tier.purchaseAddress));
-
-                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('买券地址已复制')));
-
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('买券地址已复制')),
+                    );
                   },
-
                   child: const Text('复制买券地址'),
-
                 ),
-
                 FilledButton(
-
                   onPressed: () => setState(() => _selectedTier = tier),
-
                   child: Text(isSelected ? '已选此档' : '选此档排单'),
-
                 ),
-
               ],
-
             ),
-
           ],
-
         ),
-
       ),
-
     );
-
   }
 
-
-
-  Widget _myStatus(String me) {
+  Widget _myStatus(BuildContext context, String me) {
+    final state = context.watch<AppState>();
 
     PoolCycleResult? mine;
-
     PoolEntry? myEntry;
-
     final myPay = <SplitAssignment>[];
     final myRecv = <SplitAssignment>[];
     final myTicketSurplus = <TicketSurplusAssignment>[];
@@ -362,68 +271,42 @@ class _PoolQueueScreenState extends State<PoolQueueScreen> {
       }
     }
 
-
-
     if (mine == null) {
-
       return const Card(
-
         child: Padding(
-
           padding: EdgeInsets.all(14),
-
           child: Text('您尚未在本日快照内检测到买券进场记录'),
-
         ),
-
       );
-
     }
 
-
-
     return Card(
-
       color: const Color(0xFF1A2744),
-
       child: Padding(
-
         padding: const EdgeInsets.all(14),
-
         child: Column(
-
           crossAxisAlignment: CrossAxisAlignment.start,
-
           children: [
-
             const Text('我的排单', style: TextStyle(fontWeight: FontWeight.w600)),
-
+            const Text(
+              '以下状态来自平台快照；付出场池后请用「刷新链上验款」核对链上 tx。',
+              style: TextStyle(fontSize: 11, color: Colors.white54),
+            ),
             if (myEntry != null)
               Text(
                 '状态：${_statusLabel(myEntry.status)} · 队列 #${myEntry.queueIndex}',
                 style: const TextStyle(fontSize: 12),
               ),
-
             if (myRecv.isNotEmpty) ...[
-
               const SizedBox(height: 8),
-
               Text(
-
                 '应收出场 ${myRecv.first.exitAmountTrx.toStringAsFixed(0)} TRX · '
-
                 '收款地址 ${myRecv.first.collectorAddress}',
-
                 style: const TextStyle(fontSize: 12, color: Colors.greenAccent),
-
               ),
-
             ],
-
             if (myPay.isNotEmpty) ...[
-
               const SizedBox(height: 8),
-
               const Text('我的出场打款（pay_in → 出场池）', style: TextStyle(fontWeight: FontWeight.w500)),
               ...myPay.map((a) => Padding(
                     padding: const EdgeInsets.only(top: 6),
@@ -439,31 +322,28 @@ class _PoolQueueScreenState extends State<PoolQueueScreen> {
                       ],
                     ),
                   )),
-
               const SizedBox(height: 8),
-
-              OutlinedButton(
-
-                onPressed: () {
-
-                  ScaffoldMessenger.of(context).showSnackBar(
-
-                    const SnackBar(
-
-                      content: Text('付清出场池任务后点「刷新链上状态」→ 自动查主网出场池入账'),
-
-                    ),
-
-                  );
-
-                },
-
-                child: const Text('刷新链上状态'),
-
+              Row(
+                children: [
+                  FilledButton(
+                    onPressed: _loading ? null : () => _payExitPool(context, state, myPay.first),
+                    child: const Text('立即付出场池'),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton(
+                    onPressed: _loading ? null : _refreshChainVerify,
+                    child: const Text('刷新链上验款'),
+                  ),
+                ],
               ),
-
+              const Padding(
+                padding: EdgeInsets.only(top: 6),
+                child: Text(
+                  '付款后须用 TronGrid Key 验款；快照仅用于展示，不认链上到账。',
+                  style: TextStyle(fontSize: 11, color: Colors.white54),
+                ),
+              ),
             ],
-
             if (myTicketSurplus.isNotEmpty) ...[
               const SizedBox(height: 8),
               const Text('多余额度 → 排单券地址', style: TextStyle(fontSize: 12, color: Colors.amber)),
@@ -472,15 +352,10 @@ class _PoolQueueScreenState extends State<PoolQueueScreen> {
                     style: const TextStyle(fontSize: 11),
                   )),
             ],
-
           ],
-
         ),
-
       ),
-
     );
-
   }
 
   static String _statusLabel(String status) {
@@ -498,11 +373,61 @@ class _PoolQueueScreenState extends State<PoolQueueScreen> {
     return labels[status] ?? status;
   }
 
+  static String _shortHash(String? hash) {
+    if (hash == null || hash.isEmpty) return '';
+    final n = hash.length < 12 ? hash.length : 12;
+    return ' · ${hash.substring(0, n)}…';
+  }
+
   static String _fmtDeadline(int ms) {
     final d = DateTime.fromMillisecondsSinceEpoch(ms, isUtc: true).toLocal();
     return '${d.month}/${d.day} ${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
   }
 
+  Future<void> _payExitPool(
+    BuildContext context,
+    AppState state,
+    SplitAssignment assignment,
+  ) async {
+    final amount = assignment.amountTrx;
+    final to = assignment.collectorAddress;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('确认付出场池'),
+        content: Text(
+          '将从您的钱包转出 ${amount.toStringAsFixed(0)} TRX\n'
+          '至出场池：$to\n\n'
+          '须由当前付款地址发出（谁付谁收）。付清后请配置 TronGrid Key 并点「刷新链上验款」。',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('确认付款')),
+        ],
+      ),
+    );
+    if (ok != true || !context.mounted) return;
+
+    try {
+      final tx = await state.payExitPoolAssignment(
+        toAddress: to,
+        amountTrx: amount,
+      );
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '已提交打款${state.demoPayments ? '（演示）' : ''}。'
+            '请配置 TronGrid Key 后点「刷新链上验款」。\n$tx',
+          ),
+        ),
+      );
+      if (state.hasTronGridApiKey) {
+        await _refreshChainVerify();
+      }
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('打款失败: $e')));
+    }
+  }
 }
-
-

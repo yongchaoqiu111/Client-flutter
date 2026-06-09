@@ -12,6 +12,8 @@ Future<bool> showTicketSelfPayConfirmDialog(
   required String chain,
   required int qty,
   bool demoMode = false,
+  String? headline,
+  String? payerBindingNote,
 }) async {
   TransferFeeEstimate fee;
   try {
@@ -33,7 +35,14 @@ Future<bool> showTicketSelfPayConfirmDialog(
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text('购买 $qty 张排单券', style: const TextStyle(fontWeight: FontWeight.w600)),
+            Text(headline ?? '购买 $qty 张排单券', style: const TextStyle(fontWeight: FontWeight.w600)),
+            if (payerBindingNote != null && payerBindingNote.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text(
+                payerBindingNote,
+                style: const TextStyle(fontSize: 12, color: Colors.cyanAccent, height: 1.45),
+              ),
+            ],
             const SizedBox(height: 12),
             _row('付款钱包', fromAddress),
             const SizedBox(height: 8),

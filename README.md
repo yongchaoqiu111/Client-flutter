@@ -41,29 +41,36 @@ flutter run                # 已连接手机
 - API：`http://127.0.0.1:8443`
 - WSS：`ws://127.0.0.1:8443/ws`
 
-## 链上排单（pool-v4-dual-pool）
-
-App 内 **链上排单** 页为方案 A：TronGrid 拉买券 + 出场池入账，本地 Dart 引擎回放。**算法说明文档在本仓库**：
+## 链上排单（pool-v4 · 一期 Vercel 快照）
 
 | 文档 | 说明 |
 |------|------|
-| [docs/pool-v4-algorithm-zh.md](docs/pool-v4-algorithm-zh.md) | 中文版 |
-| [docs/pool-v4-algorithm-en.md](docs/pool-v4-algorithm-en.md) | English |
+| [docs/pool-v4-algorithm-zh.md](docs/pool-v4-algorithm-zh.md) | 算法中文版 |
+| [docs/pool-snapshot-phase2-upgrade-zh.md](docs/pool-snapshot-phase2-upgrade-zh.md) | **一期→二期 WSS 升级指南** |
+| [docs/pool-snapshot-server-zh.md](docs/pool-snapshot-server-zh.md) | 快照服务器设计 |
+
+**快照仓（算法 + 每日 JSON）**：[yongchaoqiu111/js](https://github.com/yongchaoqiu111/js) → Vercel CDN
+
+| 功能 | 需要用户 TronGrid Key |
+|------|----------------------|
+| 看全队排单大盘 | ❌（读平台快照） |
+| 付出场池后验款 / 刷新链上状态 | ✅ |
 
 | 模块 | 路径 |
 |------|------|
-| 规则配置 | `lib/config/pool_rules_config.dart` |
-| 匹配引擎 | `lib/services/pool_engine_service.dart` |
-| TronGrid 拉取 | `lib/services/pool_matcher_service.dart` |
-| 出场验款 | `lib/services/exit_pay_verify.dart` |
-| 快照持久化 | `lib/services/pool_snapshot_store.dart` |
-
-出场池地址（三档默认）：`TRjvctzrc5WcEeu2UrT8mV5H6zW8dCgimR`
+| 数据门禁说明 | `lib/config/pool_data_policy.dart` |
+| 快照 URL 配置 | `lib/config/pool_snapshot_config.dart` |
+| 远程快照拉取 | `lib/services/pool_remote_snapshot_service.dart` |
+| 匹配（快照优先） | `lib/services/pool_matcher_service.dart` |
+| Key 注册引导 | `lib/screens/trongrid_api_key_screen.dart` |
 
 ## 打包
 
 ```bash
-flutter build apk --release
+# 默认已内置 js-chi-flax.vercel.app，可覆盖或加多 V 分流
+flutter build apk --release \
+  --dart-define=POOL_SNAPSHOT_URL=https://js-chi-flax.vercel.app
+
 flutter build web --release
 flutter build windows --release
 ```
