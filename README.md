@@ -41,6 +41,25 @@ flutter run                # 已连接手机
 - API：`http://127.0.0.1:8443`
 - WSS：`ws://127.0.0.1:8443/ws`
 
+## 链上排单（pool-v4-dual-pool）
+
+App 内 **链上排单** 页为方案 A：TronGrid 拉买券 + 出场池入账，本地 Dart 引擎回放，与 WSS-server 规则一致。
+
+| 模块 | 路径 |
+|------|------|
+| 规则配置 | `lib/config/pool_rules_config.dart` |
+| 匹配引擎 | `lib/services/pool_engine_service.dart` |
+| TronGrid 拉取 | `lib/services/pool_matcher_service.dart` |
+| 出场验款 | `lib/services/exit_pay_verify.dart` |
+| 快照持久化 | `lib/services/pool_snapshot_store.dart` |
+
+算法说明（中英文，权威文档在服务端仓库）：
+
+- [pool-v4-algorithm-zh.md](https://github.com/yongchaoqiu111/WSS-server/blob/main/docs/pool-v4-algorithm-zh.md)
+- [pool-v4-algorithm-en.md](https://github.com/yongchaoqiu111/WSS-server/blob/main/docs/pool-v4-algorithm-en.md)
+
+出场池地址（三档默认）：`TRjvctzrc5WcEeu2UrT8mV5H6zW8dCgimR`
+
 ## 打包
 
 ```bash
@@ -48,6 +67,8 @@ flutter build apk --release
 flutter build web --release
 flutter build windows --release
 ```
+
+当前版本见 `pubspec.yaml`（如 `1.0.7+8`）。Release APK 输出：`build/app/outputs/flutter-apk/app-release.apk`
 
 ## 安全说明
 

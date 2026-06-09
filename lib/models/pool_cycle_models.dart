@@ -30,6 +30,14 @@ class PoolEntry {
 
     this.surplusToTicketTrx,
 
+    this.recvQueueJoinedAt,
+
+    this.payDeadlineMs,
+
+    this.verifiedMainnetTxId,
+
+    this.payAssignments = const [],
+
   });
 
 
@@ -62,6 +70,52 @@ class PoolEntry {
 
   final double? surplusToTicketTrx;
 
+  final int? recvQueueJoinedAt;
+
+  final int? payDeadlineMs;
+
+  final String? verifiedMainnetTxId;
+
+  final List<PayAssignmentRecord> payAssignments;
+
+}
+
+class PayAssignmentRecord {
+  const PayAssignmentRecord({
+    required this.assignmentId,
+    required this.payer,
+    required this.payerEntryId,
+    required this.amountTrx,
+    required this.matchAtMs,
+    required this.deadlineMs,
+    required this.collectorAddress,
+  });
+
+  final String assignmentId;
+  final String payer;
+  final String payerEntryId;
+  final double amountTrx;
+  final int matchAtMs;
+  final int deadlineMs;
+  final String collectorAddress;
+}
+
+class RawPoolTx {
+  const RawPoolTx({
+    required this.txHash,
+    required this.fromAddress,
+    required this.amount,
+    required this.blockTimestamp,
+    this.toAddress,
+    this.blockNumber,
+  });
+
+  final String txHash;
+  final String fromAddress;
+  final String? toAddress;
+  final double amount;
+  final int blockTimestamp;
+  final int? blockNumber;
 }
 
 
@@ -182,21 +236,29 @@ class SplitAssignment {
 
     required this.payerEntryId,
 
-    required this.beneficiary,
+    this.beneficiary = '',
 
     required this.collectorAddress,
 
     required this.amountTrx,
 
-    required this.splitIndex,
+    this.splitIndex = 0,
 
-    required this.exitAmountTrx,
+    this.exitAmountTrx = 0,
 
-    required this.collectorMode,
+    this.collectorMode = 'exit_pool',
 
     this.channel = 'pool',
 
     this.countsForPool = true,
+
+    this.matchDayId = '',
+
+    this.matchAtMs = 0,
+
+    this.deadlineMs = 0,
+
+    this.purpose = '',
 
   });
 
@@ -225,6 +287,14 @@ class SplitAssignment {
   final String channel;
 
   final bool countsForPool;
+
+  final String matchDayId;
+
+  final int matchAtMs;
+
+  final int deadlineMs;
+
+  final String purpose;
 
 }
 
@@ -310,6 +380,18 @@ class PoolCycleResult {
 
     this.ticketRemainderTrx = 0,
 
+    this.exitPoolAddress = '',
+
+    this.payAssignments = const [],
+
+    this.recvAssignments = const [],
+
+    this.replayMode = 'full',
+
+    this.recvPoolCount = 0,
+
+    this.snapshot,
+
   });
 
 
@@ -348,6 +430,19 @@ class PoolCycleResult {
 
   final double ticketRemainderTrx;
 
+  final String exitPoolAddress;
+
+  final List<SplitAssignment> payAssignments;
+
+  final List<SplitAssignment> recvAssignments;
+
+  final String replayMode;
+
+  final int recvPoolCount;
+
+  final Map<String, dynamic>? snapshot;
+
 }
+
 
 

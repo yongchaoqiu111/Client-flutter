@@ -1,16 +1,69 @@
 import '../config/pool_rules_config.dart';
 import '../models/pool_cycle_models.dart';
+import 'exit_pay_verify.dart';
+import 'pool_snapshot.dart';
 
-/// 无服务器排单（Dart 引擎仍为 v3 路径，v4 双池以 WSS-server/shared/pool-rules.js 为准）
+/// 无服务器排单 · pool-v4-dual-pool（与 WSS-server/shared/pool-rules.js 对齐）
 class PoolEngineService {
   static const _msDay = 24 * 3600 * 1000;
+  static const payInChannel = 'pay_in';
+  static const recvOutChannel = 'recv_out';
+  static const ticketSurplusChannel = 'ticket_surplus';
 
-  List<PoolEntry> buildEntries(String poolId, List<RawPoolTx> txs) {
-    final cfg = kPoolTiers.firstWhere((t) => t.id == poolId);
-    final sorted = _sortTxs(txs);
-    final valid = sorted
-        .where((tx) => (tx.amount - cfg.ticketPriceTrx).abs() < 0.000001)
-        .toList();
+  static const _payPoolActive = {'pay_queued', 'pay_pending'};
+  static const _frozenStatuses = {
+    'pay_pending',
+    'pay_expired',
+    'recv_queued',
+    'recv_partial',
+    'recv_pending',
+    'done',
+    'consumed',
+    'blocked',
+  };
+
+  List<RawPoolTx> sortPoolTxs(List<RawPoolTx> txs) {
+    final sorted = [...txs];
+    sorted.sort((a, b) {
+      final bn = (a.blockNumber ?? 0) - (b.blockNumber ?? 0);
+      if (bn != 0) return bn;
+      final bt = a.blockTimestamp - b.blockTimestamp;
+      if (bt != 0) return bt;
+      return a.txHash.compareTo(b.txHash);
+    });
+    return sorted;
+  }
+
+  List<RawPoolTx> filterByCheckpoint(List<RawPoolTx> txs, int? cutoffMs) {
+    if (cutoffMs == null) return txs;
+    return txs.where((t) => t.blockTimestamp <= cutoffMs).toList();
+  }
+
+  int utcDayMs(int tsMs) {
+    final d = DateTime.fromMillisecondsSinceEpoch(tsMs, isUtc: true);
+    return DateTime.utc(d.year, d.month, d.day).millisecondsSinceEpoch;
+  }
+
+  PoolTierConfig _poolConfig(String poolId) =>
+      kPoolTiers.firstWhere((p) => p.id == poolId);
+
+  double remainingCreditOf(PoolEntry entry) {
+    if (!_payPoolActive.contains(entry.status)) return 0;
+    return entry.remainingPoolCreditTrx ?? entry.poolCreditTrx;
+  }
+
+  double poolLedgerBalance(List<PoolEntry> entries, [List<MatchDaySummary> matchDays = const []]) {
+    final committed = entries
+        .where((e) => !{'blocked', 'pay_expired', 'done'}.contains(e.status))
+        .fold(0.0, (s, e) => s + e.poolCreditTrx);
+    final consumed = matchDays.fold(0.0, (s, d) => s + d.matchedCreditTrx);
+    return _round4(committed - consumed);
+  }
+
+  List<PoolEntry> buildEntries(String poolId, List<RawPoolTx> txs, [int queueIndexStart = 0]) {
+    final cfg = _poolConfig(poolId);
+    final sorted = sortPoolTxs(txs);
+    final valid = sorted.where((tx) => (tx.amount - cfg.ticketPriceTrx).abs() < 0.000001).toList();
     return List.generate(valid.length, (i) {
       final tx = valid[i];
       return PoolEntry(
@@ -22,358 +75,741 @@ class PoolEngineService {
         remainingPoolCreditTrx: cfg.poolCreditTrx,
         exitAmountTrx: cfg.exitAmountTrx,
         blockTimestamp: tx.blockTimestamp,
-        queueIndex: i + 1,
-        status: 'queued',
+        queueIndex: queueIndexStart + i + 1,
+        status: 'pay_queued',
       );
     });
   }
 
-  List<PoolEntry> applyLifecycle(List<PoolEntry> entries, List<PoolExitAnchor> anchors) {
-    final anchorByEntry = {for (final a in anchors) a.entryId: a};
+  List<PoolEntry> applyLifecycle(List<PoolEntry> entries, Set<String> blockedPayers) {
     final openByPayer = <String, String>{};
     final result = <PoolEntry>[];
-
-    const frozenStatuses = {'done', 'blocked', 'consumed', 'exit_pending', 'exit_partial'};
-
     for (final e in entries) {
-      final anchor = anchorByEntry[e.entryId];
-      if (anchor != null) {
-        result.add(PoolEntry(
-          entryId: e.entryId,
-          poolId: e.poolId,
-          payer: e.payer,
-          ticketPaidTrx: e.ticketPaidTrx,
-          poolCreditTrx: e.poolCreditTrx,
-          remainingPoolCreditTrx: 0,
-          exitAmountTrx: e.exitAmountTrx,
-          blockTimestamp: e.blockTimestamp,
-          queueIndex: e.queueIndex,
-          status: 'done',
-          completedAt: anchor.anchoredAt,
-        ));
-        continue;
-      }
-      if (frozenStatuses.contains(e.status)) {
+      if (_frozenStatuses.contains(e.status)) {
         result.add(e);
         continue;
       }
+      if (blockedPayers.contains(e.payer)) {
+        result.add(_copyEntry(e, status: 'blocked', blockReason: '一次只能排一单', remainingPoolCreditTrx: 0));
+        continue;
+      }
       if (openByPayer.containsKey(e.payer)) {
-        result.add(PoolEntry(
-          entryId: e.entryId,
-          poolId: e.poolId,
-          payer: e.payer,
-          ticketPaidTrx: e.ticketPaidTrx,
-          poolCreditTrx: e.poolCreditTrx,
-          remainingPoolCreditTrx: 0,
-          exitAmountTrx: e.exitAmountTrx,
-          blockTimestamp: e.blockTimestamp,
-          queueIndex: e.queueIndex,
-          status: 'blocked',
-          blockReason: '一次只能排一单',
-        ));
+        result.add(_copyEntry(e, status: 'blocked', blockReason: '一次只能排一单', remainingPoolCreditTrx: 0));
         continue;
       }
       openByPayer[e.payer] = e.entryId;
-      result.add(PoolEntry(
-        entryId: e.entryId,
-        poolId: e.poolId,
-        payer: e.payer,
-        ticketPaidTrx: e.ticketPaidTrx,
-        poolCreditTrx: e.poolCreditTrx,
+      result.add(_copyEntry(
+        e,
+        status: 'pay_queued',
         remainingPoolCreditTrx: e.remainingPoolCreditTrx ?? e.poolCreditTrx,
-        exitAmountTrx: e.exitAmountTrx,
-        blockTimestamp: e.blockTimestamp,
-        queueIndex: e.queueIndex,
-        status: 'queued',
       ));
     }
     return result;
   }
 
-  double poolLedgerBalance(List<PoolEntry> entries, List<_MatchDaySummary> matchDays) {
-    final committed = entries
-        .where((e) => e.status != 'blocked' && e.status != 'done')
-        .fold(0.0, (s, e) => s + e.poolCreditTrx);
-    final consumed = matchDays.fold(0.0, (s, d) => s + d.matchedCreditTrx);
-    return _round4(committed - consumed);
-  }
-
-  double _remainingCredit(PoolEntry e) {
-    if (e.status != 'queued') return 0;
-    return e.remainingPoolCreditTrx ?? e.poolCreditTrx;
+  List<PoolEntry> mergeEntryStates(List<PoolEntry> fresh, Map<String, PoolEntry> stateMap) {
+    return fresh.map((e) {
+      final prev = stateMap[e.entryId];
+      if (prev == null) return e;
+      return _copyEntry(
+        e,
+        status: prev.status,
+        remainingPoolCreditTrx: prev.remainingPoolCreditTrx,
+        exitRemainderTrx: prev.exitRemainderTrx,
+        surplusToTicketTrx: prev.surplusToTicketTrx,
+        recvQueueJoinedAt: prev.recvQueueJoinedAt,
+        payAssignments: prev.payAssignments,
+        completedAt: prev.completedAt,
+        blockReason: prev.blockReason,
+        verifiedMainnetTxId: prev.verifiedMainnetTxId,
+        payDeadlineMs: prev.payDeadlineMs,
+      );
+    }).toList();
   }
 
   PoolFillState poolFillState(
     String poolId,
     List<PoolEntry> entries,
     int evaluationMs, [
-    List<_MatchDaySummary> matchDays = const [],
+    List<MatchDaySummary> matchDays = const [],
   ]) {
-    final cfg = kPoolTiers.firstWhere((t) => t.id == poolId);
+    final cfg = _poolConfig(poolId);
     final credits = poolLedgerBalance(entries, matchDays);
     final queuedCredits = entries
-        .where((e) => e.status == 'queued')
-        .fold(0.0, (s, e) => s + _remainingCredit(e));
-    final active = entries.where((e) => e.status != 'blocked' && e.status != 'done').toList();
+        .where((e) => _payPoolActive.contains(e.status))
+        .fold(0.0, (s, e) => s + remainingCreditOf(e));
+    final active = entries.where((e) => !{'blocked', 'pay_expired', 'done'}.contains(e.status)).toList();
     final firstTs = active.isEmpty
         ? null
         : active.map((e) => e.blockTimestamp).reduce((a, b) => a < b ? a : b);
-    const minFillMs = PoolRulesConfig.entryPeriodDays * _msDay;
+    final minFillMs = PoolRulesConfig.entryPeriodDays * _msDay;
     final full = credits >= cfg.poolTargetTrx;
-    final overflow = _round4(credits > cfg.poolTargetTrx ? credits - cfg.poolTargetTrx : 0);
-    final days = firstTs == null ? 0 : ((evaluationMs - firstTs) / _msDay).floor();
+    final days = firstTs != null ? ((evaluationMs - firstTs) / _msDay).floor() : 0;
     final entryOk = firstTs != null && evaluationMs >= firstTs + minFillMs;
-    final consumed = matchDays.fold(0.0, (s, d) => s + d.matchedCreditTrx);
+    final overflow = _round4((credits - cfg.poolTargetTrx).clamp(0, double.infinity));
 
     return PoolFillState(
       poolId: poolId,
       totalPoolCreditTrx: credits,
-      queuedPoolCreditTrx: queuedCredits,
-      consumedPoolCreditTrx: consumed,
-      overflowPoolCreditTrx: overflow,
       targetTrx: cfg.poolTargetTrx,
-      entryCount: entries.where((e) => e.status == 'queued').length,
+      entryCount: entries.where((e) => _payPoolActive.contains(e.status)).length,
       isFull: full,
-      fillPercent: cfg.poolTargetTrx > 0 ? (credits / cfg.poolTargetTrx * 100).clamp(0, 100) : 0,
+      fillPercent: (credits / cfg.poolTargetTrx * 100).clamp(0, 100).toDouble(),
       entryPeriodSatisfied: entryOk,
       canMatch: full && entryOk && overflow > 0.000001,
       daysSinceFirstEntry: days,
       ticketPriceTrx: cfg.ticketPriceTrx,
       poolCreditPerTicket: cfg.poolCreditTrx,
+      queuedPoolCreditTrx: queuedCredits,
+      consumedPoolCreditTrx: matchDays.fold<double>(0, (s, d) => s + d.matchedCreditTrx),
+      overflowPoolCreditTrx: overflow,
     );
   }
 
-  _SplitResult _buildSplitInternal(
+  _DayMatchResult buildDayMatch(
     String poolId,
     List<PoolEntry> entries,
-    List<PoolExitAnchor> anchors,
     int evaluationMs,
-    List<_MatchDaySummary> matchDays,
+    List<MatchDaySummary> matchDays,
   ) {
-    final cfg = kPoolTiers.firstWhere((t) => t.id == poolId);
+    final cfg = _poolConfig(poolId);
+    final exitPoolAddress = cfg.exitPoolAddress;
     final fill = poolFillState(poolId, entries, evaluationMs, matchDays);
-    if (!fill.canMatch) {
-      return _SplitResult(fill: fill);
-    }
-
-    final queued = entries.where((e) => e.status == 'queued').toList()
-      ..sort((a, b) => a.queueIndex.compareTo(b.queueIndex));
-    if (queued.isEmpty) return _SplitResult(fill: fill);
-
-    String collectorFor(PoolEntry entry) {
-      final a = anchors.where((x) => x.entryId == entry.entryId).firstOrNull;
-      if (a != null && a.payee.isNotEmpty) return a.payee;
-      return cfg.purchaseAddress;
-    }
-
-    final hasPersonal = anchors.any((a) => a.payee.isNotEmpty && a.payee != cfg.purchaseAddress);
-    final collectorMode = hasPersonal ? 'exit_pool' : 'purchase_address';
-    final exitAmount = cfg.exitAmountTrx;
     final overflow = fill.overflowPoolCreditTrx ?? 0;
-    if (overflow <= 0.000001) return _SplitResult(fill: fill);
-
-    final partialEntries = entries.where((e) => e.status == 'exit_partial').toList()
-      ..sort((a, b) => a.queueIndex.compareTo(b.queueIndex));
-    final partialNeed = partialEntries.fold(
-      0.0,
-      (s, e) => s + (e.exitRemainderTrx ?? exitAmount),
+    final empty = _DayMatchResult(
+      fill: fill,
+      exitPoolAddress: exitPoolAddress,
+      purchaseAddress: cfg.purchaseAddress,
+      overflowPoolCreditTrx: overflow,
     );
-    final overflowForNew = _round4(overflow - partialNeed < 0 ? 0 : overflow - partialNeed);
-    final fullNewCount = (overflowForNew / exitAmount).floor();
-    final remainderTrx = _round4(overflowForNew - fullNewCount * exitAmount);
-
-    final partialIds = partialEntries.map((e) => e.entryId).toSet();
-    final newCandidates = queued.where((e) => !partialIds.contains(e.entryId)).toList();
-    final fullNewEntries = newCandidates.take(fullNewCount).toList();
-    final partialNewEntries =
-        remainderTrx > 0.000001 && newCandidates.length > fullNewCount
-            ? [newCandidates[fullNewCount]]
-            : <PoolEntry>[];
-    final ticketRemainderTrx =
-        remainderTrx > 0.000001 && partialNewEntries.isEmpty ? remainderTrx : 0.0;
-
-    final receiverIds = {
-      ...partialIds,
-      ...fullNewEntries.map((e) => e.entryId),
-      ...partialNewEntries.map((e) => e.entryId),
-    };
-    final overflowPayers = _selectOverflowPayers(queued, overflow, receiverIds);
-
-    final receivers = <_ReceiverSlot>[
-      ...partialEntries.map((e) => _ReceiverSlot(
-            slotId: 'recv_${e.entryId}',
-            entryId: e.entryId,
-            beneficiary: e.payer,
-            collectorAddress: collectorFor(e),
-            remainingTrx: e.exitRemainderTrx ?? exitAmount,
-          )),
-      ...fullNewEntries.map((e) => _ReceiverSlot(
-            slotId: 'recv_${e.entryId}',
-            entryId: e.entryId,
-            beneficiary: e.payer,
-            collectorAddress: collectorFor(e),
-            remainingTrx: exitAmount,
-          )),
-      ...partialNewEntries.map((e) => _ReceiverSlot(
-            slotId: 'recv_${e.entryId}',
-            entryId: e.entryId,
-            beneficiary: e.payer,
-            collectorAddress: collectorFor(e),
-            remainingTrx: exitAmount,
-          )),
-    ];
-    final fundingPayers = overflowPayers;
-    final receiverCount = receivers.length;
-    final remainderToReceiverTrx = partialNewEntries.isNotEmpty ? remainderTrx : 0.0;
-
-    final assignments = <SplitAssignment>[];
-    var payerIdx = 0;
-
-    for (final recv in receivers) {
-      while (recv.remainingTrx > 0.000001) {
-        while (payerIdx < fundingPayers.length &&
-            (fundingPayers[payerIdx].availableTrx <= 0.000001 ||
-                fundingPayers[payerIdx].splitCount >= PoolRulesConfig.maxSplitsPerPayer)) {
-          payerIdx++;
-        }
-        if (payerIdx >= fundingPayers.length) break;
-
-        final payer = fundingPayers[payerIdx];
-        final chunk = payer.availableTrx < recv.remainingTrx
-            ? payer.availableTrx
-            : recv.remainingTrx;
-
-        assignments.add(SplitAssignment(
-          assignmentId: 'asg_${recv.slotId}_${payer.entryId}_${assignments.length}',
-          poolId: poolId,
-          payer: payer.payer,
-          payerEntryId: payer.entryId,
-          beneficiary: recv.beneficiary,
-          collectorAddress: recv.collectorAddress,
-          amountTrx: _round4(chunk),
-          splitIndex: payer.splitCount + 1,
-          exitAmountTrx: exitAmount,
-          collectorMode: collectorMode,
-        ));
-
-        payer.availableTrx = _round4(payer.availableTrx - chunk);
-        payer.splitCount++;
-        recv.remainingTrx = _round4(recv.remainingTrx - chunk);
-      }
-    }
+    if (!fill.canMatch || overflow <= 0.000001) return empty;
 
     final matchDayId =
         DateTime.fromMillisecondsSinceEpoch(evaluationMs, isUtc: true).toIso8601String().substring(0, 10);
-    final ticketSurplus =
-        _buildTicketRemainder(poolId, ticketRemainderTrx, fundingPayers, cfg.purchaseAddress, matchDayId);
-    final deployed = _round4(
-      assignments.fold(0.0, (s, a) => s + a.amountTrx) +
+    final payQueued = entries.where((e) => e.status == 'pay_queued').toList()
+      ..sort((a, b) => a.queueIndex.compareTo(b.queueIndex));
+
+    final payers = _selectPayPoolPayers(payQueued, overflow);
+    final payAssignments =
+        _buildPayInAssignments(poolId, payers, exitPoolAddress, evaluationMs, matchDayId);
+    final recvSplit = _buildRecvPhase(
+      poolId,
+      entries,
+      overflow,
+      cfg.exitAmountTrx,
+      exitPoolAddress,
+      matchDayId,
+      evaluationMs,
+    );
+    final ticketSurplus = _buildTicketRemainderAssignments(
+      poolId,
+      recvSplit.ticketRemainderTrx,
+      payers,
+      cfg.purchaseAddress,
+      matchDayId,
+    );
+
+    final deployedTrx = _round4(
+      payAssignments.fold(0.0, (s, a) => s + a.amountTrx) +
           ticketSurplus.fold(0.0, (s, a) => s + a.amountTrx),
     );
-    final matchedCreditTrx = deployed > 0.000001 ? deployed : overflow;
-    return _SplitResult(
+
+    return _DayMatchResult(
       fill: fill,
-      receivers: receivers,
-      payers: fundingPayers,
-      assignments: assignments,
+      payAssignments: payAssignments,
+      recvPhase: recvSplit,
       ticketSurplusAssignments: ticketSurplus,
-      matchedCreditTrx: matchedCreditTrx,
-      collectorMode: collectorMode,
+      matchedCreditTrx: deployedTrx > 0.000001 ? deployedTrx : _round4(overflow),
       overflowPoolCreditTrx: overflow,
-      receiverCount: receiverCount,
-      remainderTrx: remainderTrx,
-      remainderToReceiverTrx: remainderToReceiverTrx,
-      ticketRemainderTrx: ticketRemainderTrx,
+      exitPoolAddress: exitPoolAddress,
+      purchaseAddress: cfg.purchaseAddress,
     );
   }
 
-  List<_FundingPayer> _selectOverflowPayers(
-    List<PoolEntry> queued,
-    double overflowAmount,
-    Set<String> excludeIds,
+  _VerifyResult applyPayVerifications(
+    List<PoolEntry> entries,
+    List<RawPoolTx> exitPoolTxs,
+    String exitPoolAddress,
+    int evaluationMs,
+    Set<String> usedExitTxIds,
   ) {
-    final payers = <_FundingPayer>[];
+    final entryMap = {for (final e in entries) e.entryId: e};
+    final pendingAssigns = <PayAssignmentRecord>[];
+    final used = {...usedExitTxIds};
+    for (final e in entries) {
+      if (e.status == 'pay_pending' && e.payAssignments.isNotEmpty) {
+        pendingAssigns.addAll(e.payAssignments);
+      }
+      if (e.verifiedMainnetTxId != null) used.add(e.verifiedMainnetTxId!);
+    }
+    if (pendingAssigns.isEmpty) {
+      return _VerifyResult(entries: entries, usedExitTxIds: used);
+    }
+
+    final result = ExitPayVerify.derivePayVerifications(
+      pendingAssigns,
+      exitPoolTxs,
+      exitPoolAddress,
+      evaluationMs,
+      used,
+    );
+    used.addAll(result.usedTxIds);
+
+    for (final v in result.verified) {
+      final e = entryMap[v.entryId];
+      if (e == null) continue;
+      entryMap[v.entryId] = _copyEntry(
+        e,
+        status: 'recv_queued',
+        recvQueueJoinedAt: v.verifiedAtMs,
+        verifiedMainnetTxId: v.mainnetTxId,
+        remainingPoolCreditTrx: 0,
+        payAssignments: const [],
+        completedAt: null,
+      );
+      used.add(v.mainnetTxId);
+    }
+    for (final x in result.expired) {
+      final e = entryMap[x.entryId];
+      if (e == null) continue;
+      entryMap[x.entryId] = _copyEntry(
+        e,
+        status: 'pay_expired',
+        remainingPoolCreditTrx: 0,
+        payAssignments: const [],
+        blockReason: '出场打款超时',
+      );
+    }
+    return _VerifyResult(entries: entryMap.values.toList(), usedExitTxIds: used);
+  }
+
+  List<PoolEntry> applyPayInTasks(List<PoolEntry> entries, List<SplitAssignment> payAssignments) {
+    final entryMap = {for (final e in entries) e.entryId: e};
+    final byEntry = <String, List<SplitAssignment>>{};
+    for (final a in payAssignments) {
+      byEntry.putIfAbsent(a.payerEntryId, () => []).add(a);
+    }
+    for (final entry in byEntry.entries) {
+      final e = entryMap[entry.key];
+      if (e == null || e.status != 'pay_queued') continue;
+      final assigns = entry.value
+          .map((a) => PayAssignmentRecord(
+                assignmentId: a.assignmentId,
+                payer: a.payer,
+                payerEntryId: a.payerEntryId,
+                amountTrx: a.amountTrx,
+                matchAtMs: a.matchAtMs,
+                deadlineMs: a.deadlineMs,
+                collectorAddress: a.collectorAddress,
+              ))
+          .toList();
+      entryMap[entry.key] = _copyEntry(
+        e,
+        status: 'pay_pending',
+        payAssignments: assigns,
+        payDeadlineMs: assigns.map((x) => x.deadlineMs).reduce((a, b) => a > b ? a : b),
+      );
+    }
+    return entryMap.values.toList();
+  }
+
+  List<PoolEntry> applyRecvConsumption(List<PoolEntry> entries, _RecvPhaseResult recvSplit, double exitAmount) {
+    final entryMap = {for (final e in entries) e.entryId: e};
+    for (final recv in recvSplit.receivers) {
+      final e = entryMap[recv.entryId];
+      if (e == null) continue;
+      if (recv.isRemainderSlot && (recv.remainderBudgetTrx ?? 0) > 0.000001) {
+        entryMap[recv.entryId] = _copyEntry(
+          e,
+          status: 'recv_partial',
+          exitRemainderTrx: _round4(exitAmount - recv.remainderBudgetTrx!),
+        );
+      } else if (recv.isPartialCarryover) {
+        var rem = _round4((e.exitRemainderTrx ?? exitAmount) - recv.needTrx);
+        var status = 'recv_partial';
+        if (rem <= 0.000001) {
+          status = 'recv_pending';
+          rem = 0;
+        }
+        entryMap[recv.entryId] = _copyEntry(e, status: status, exitRemainderTrx: rem);
+      } else {
+        entryMap[recv.entryId] = _copyEntry(e, status: 'recv_pending', exitRemainderTrx: 0);
+      }
+    }
+    return entryMap.values.toList();
+  }
+
+  _RunDayResult? runDayMatch(
+    String poolId,
+    List<RawPoolTx> purchaseTxs,
+    List<RawPoolTx> exitPoolTxs,
+    Map<String, PoolEntry> stateMap,
+    int dayStartMs,
+    List<MatchDaySummary> priorMatchDays,
+    int verifyThroughMs,
+    _ReplayCtx replayCtx,
+  ) {
+    List<PoolEntry> entries;
+    if (replayCtx.incrementalFromMs > 0) {
+      final newBuys = purchaseTxs
+          .where((t) =>
+              t.blockTimestamp > replayCtx.incrementalFromMs && t.blockTimestamp <= dayStartMs)
+          .toList();
+      entries = mergeEntryStates(buildEntries(poolId, newBuys, replayCtx.lastQueueIndex), stateMap);
+      for (final e in entries) {
+        if (e.queueIndex > replayCtx.lastQueueIndex) replayCtx.lastQueueIndex = e.queueIndex;
+      }
+    } else {
+      final dayPurchase = filterByCheckpoint(purchaseTxs, dayStartMs);
+      entries = mergeEntryStates(buildEntries(poolId, dayPurchase), stateMap);
+    }
+
+    entries = applyLifecycle(entries, replayCtx.blockedPayers);
+    final dayExit = filterByCheckpoint(exitPoolTxs, verifyThroughMs);
+    final cfg = _poolConfig(poolId);
+    final exitPoolAddress = cfg.exitPoolAddress;
+
+    final verifyResult =
+        applyPayVerifications(entries, dayExit, exitPoolAddress, verifyThroughMs, replayCtx.usedExitTxIds);
+    entries = verifyResult.entries;
+    replayCtx.usedExitTxIds = verifyResult.usedExitTxIds;
+
+    for (final e in entries) {
+      stateMap[e.entryId] = e;
+      if (e.status == 'blocked') replayCtx.blockedPayers.add(e.payer);
+      if (e.queueIndex > replayCtx.lastQueueIndex) replayCtx.lastQueueIndex = e.queueIndex;
+    }
+
+    final fill = poolFillState(poolId, entries, dayStartMs, priorMatchDays);
+    if (!fill.canMatch) return null;
+
+    final split = buildDayMatch(poolId, entries, dayStartMs, priorMatchDays);
+    if (split.payAssignments.isEmpty && split.recvAssignments.isEmpty) return null;
+
+    entries = applyPayInTasks(entries, split.payAssignments);
+    entries = applyRecvConsumption(entries, split.recvPhase!, cfg.exitAmountTrx);
+    for (final e in entries) stateMap[e.entryId] = e;
+
+    final afterMatchDays = [
+      ...priorMatchDays,
+      MatchDaySummary(matchDayId: _dayId(dayStartMs), matchedCreditTrx: split.matchedCreditTrx),
+    ];
+    return _RunDayResult(
+      entries: entries,
+      split: split,
+      summary: MatchDaySummary(
+        matchDayId: _dayId(dayStartMs),
+        matchedCreditTrx: split.matchedCreditTrx,
+        remainingPoolCreditTrx: poolFillState(poolId, entries, dayStartMs, afterMatchDays).totalPoolCreditTrx,
+      ),
+    );
+  }
+
+  _ReplayResult replayPoolTimeline(
+    String poolId,
+    List<RawPoolTx> purchaseTxs,
+    List<RawPoolTx> exitPoolTxs,
+    int wallNowMs, [
+    Map<String, dynamic>? snapshot,
+  ]) {
+    final cfg = _poolConfig(poolId);
+    final sortedPurchase = sortPoolTxs(purchaseTxs);
+    final exitPoolAddress = cfg.exitPoolAddress;
+
+    var stateMap = <String, PoolEntry>{};
+    var matchDays = <MatchDaySummary>[];
+    _ReplayCtx? replayCtx;
+    int loopStartDay;
+    _DayMatchResult? todayResult;
+
+    if (snapshot != null) {
+      final loaded = PoolSnapshotCodec.loadSnapshot(snapshot);
+      if (loaded == null) throw StateError('invalid pool snapshot');
+      if (snapshot['poolId'] != poolId) {
+        throw StateError('snapshot poolId ${snapshot['poolId']} != $poolId');
+      }
+      stateMap = loaded.stateMap;
+      matchDays = loaded.matchDays;
+      replayCtx = _ReplayCtx(
+        incrementalFromMs: loaded.incrementalFromMs,
+        blockedPayers: loaded.blockedPayers,
+        usedExitTxIds: loaded.usedExitTxIds,
+        lastQueueIndex: loaded.lastQueueIndex,
+      );
+      loopStartDay =
+          loaded.lastMatchDayMs > 0 ? loaded.lastMatchDayMs + _msDay : utcDayMs(wallNowMs);
+    } else if (sortedPurchase.isEmpty) {
+      final emptySnap = PoolSnapshotCodec.exportSnapshot(poolId, stateMap, matchDays, wallNowMs);
+      return _ReplayResult(
+        entries: const [],
+        fill: poolFillState(poolId, const [], wallNowMs),
+        exitPoolAddress: exitPoolAddress,
+        purchaseAddress: cfg.purchaseAddress,
+        snapshot: emptySnap,
+        replayMode: 'full',
+      );
+    } else {
+      final firstTs = sortedPurchase.map((t) => t.blockTimestamp).reduce((a, b) => a < b ? a : b);
+      loopStartDay = utcDayMs(firstTs + PoolRulesConfig.entryPeriodDays * _msDay);
+      replayCtx = _ReplayCtx();
+    }
+
+    final endDay = utcDayMs(wallNowMs);
+    final ctx = replayCtx!;
+
+    for (var dayMs = loopStartDay; dayMs < endDay; dayMs += _msDay) {
+      final result = runDayMatch(
+        poolId,
+        sortedPurchase,
+        exitPoolTxs,
+        stateMap,
+        dayMs,
+        matchDays,
+        dayMs + _msDay,
+        ctx,
+      );
+      if (result != null) matchDays.add(result.summary);
+    }
+
+    final todayMatch = runDayMatch(
+      poolId,
+      sortedPurchase,
+      exitPoolTxs,
+      stateMap,
+      endDay,
+      matchDays,
+      wallNowMs,
+      ctx,
+    );
+    if (todayMatch != null) {
+      matchDays.add(todayMatch.summary);
+      todayResult = todayMatch.split;
+    }
+
+    final newBuysFinal = ctx.incrementalFromMs > 0
+        ? PoolSnapshotCodec.filterTxsAfter(sortedPurchase, ctx.incrementalFromMs)
+            .where((t) => t.blockTimestamp <= wallNowMs)
+            .toList()
+        : <RawPoolTx>[];
+    if (newBuysFinal.isNotEmpty) {
+      final fresh = buildEntries(poolId, newBuysFinal, ctx.lastQueueIndex);
+      final merged = mergeEntryStates(fresh, stateMap);
+      final lifecycled = applyLifecycle(merged, ctx.blockedPayers);
+      for (final e in lifecycled) {
+        stateMap[e.entryId] = e;
+        if (e.queueIndex > ctx.lastQueueIndex) ctx.lastQueueIndex = e.queueIndex;
+      }
+    }
+
+    var entries = stateMap.values.toList()..sort((a, b) => a.queueIndex.compareTo(b.queueIndex));
+    final verifyResult = applyPayVerifications(
+      entries,
+      filterByCheckpoint(exitPoolTxs, wallNowMs),
+      exitPoolAddress,
+      wallNowMs,
+      ctx.usedExitTxIds,
+    );
+    entries = verifyResult.entries;
+    ctx.usedExitTxIds = verifyResult.usedExitTxIds;
+    for (final e in entries) stateMap[e.entryId] = e;
+
+    final fill = poolFillState(poolId, entries, wallNowMs, matchDays);
+    final split = todayResult;
+    final payAssignments = split?.payAssignments.isNotEmpty == true
+        ? split!.payAssignments
+        : entries
+            .where((e) => e.status == 'pay_pending')
+            .expand((e) => e.payAssignments)
+            .map((a) => SplitAssignment(
+                  assignmentId: a.assignmentId,
+                  poolId: poolId,
+                  payer: a.payer,
+                  payerEntryId: a.payerEntryId,
+                  collectorAddress: a.collectorAddress,
+                  amountTrx: a.amountTrx,
+                  matchAtMs: a.matchAtMs,
+                  deadlineMs: a.deadlineMs,
+                  channel: payInChannel,
+                  purpose: 'pay_pool_to_exit',
+                  matchDayId: _dayId(a.matchAtMs),
+                ))
+            .toList();
+    final recvAssignments = split?.recvPhase?.assignments ?? [];
+
+    final exportedSnapshot = PoolSnapshotCodec.exportSnapshot(
+      poolId,
+      stateMap,
+      matchDays,
+      wallNowMs,
+      blockedPayers: ctx.blockedPayers,
+      usedExitTxIds: ctx.usedExitTxIds,
+    );
+
+    return _ReplayResult(
+      entries: entries,
+      fill: fill,
+      payAssignments: payAssignments,
+      recvAssignments: recvAssignments,
+      ticketSurplusAssignments: split?.ticketSurplusAssignments ?? const [],
+      matchedCreditTrx: split?.matchedCreditTrx ?? 0,
+      overflowPoolCreditTrx: split?.overflowPoolCreditTrx ?? 0,
+      receiverCount: split?.recvPhase?.receiverCount ?? 0,
+      remainderTrx: split?.recvPhase?.remainderTrx ?? 0,
+      remainderToReceiverTrx: split?.recvPhase?.remainderToReceiverTrx ?? 0,
+      ticketRemainderTrx: split?.recvPhase?.ticketRemainderTrx ?? 0,
+      exitPoolAddress: exitPoolAddress,
+      purchaseAddress: cfg.purchaseAddress,
+      snapshot: exportedSnapshot,
+      replayMode: snapshot != null ? 'incremental' : 'full',
+    );
+  }
+
+  PoolCycleResult runPoolCycle({
+    required String poolId,
+    List<RawPoolTx> txs = const [],
+    List<RawPoolTx>? purchaseTxs,
+    List<RawPoolTx> exitPoolTxs = const [],
+    int? nowMs,
+    Map<String, dynamic>? snapshot,
+  }) {
+    final buyTxs = purchaseTxs ?? txs;
+    final wallNow = nowMs ?? DateTime.now().millisecondsSinceEpoch;
+    final matchCtx = PoolRulesConfig.dailyMatchContext(
+      DateTime.fromMillisecondsSinceEpoch(wallNow, isUtc: true),
+    );
+    final replay = replayPoolTimeline(poolId, buyTxs, exitPoolTxs, wallNow, snapshot);
+    final recvPoolCount =
+        replay.entries.where((e) => {'recv_queued', 'recv_partial', 'recv_pending'}.contains(e.status)).length;
+
+    return PoolCycleResult(
+      poolId: poolId,
+      checkpointCutoffMs: matchCtx.snapshotCutoffMs,
+      fill: replay.fill,
+      entries: replay.entries,
+      assignments: [...replay.payAssignments, ...replay.recvAssignments],
+      payAssignments: replay.payAssignments,
+      recvAssignments: replay.recvAssignments,
+      ticketSurplusAssignments: replay.ticketSurplusAssignments,
+      collectorMode: 'exit_pool',
+      purchaseAddress: replay.purchaseAddress,
+      exitPoolAddress: replay.exitPoolAddress,
+      matchDayId: matchCtx.matchDayId,
+      matchAtMs: matchCtx.matchAtMs,
+      nextMatchAtMs: matchCtx.nextMatchAtMs,
+      matchedCreditTrx: replay.matchedCreditTrx,
+      overflowPoolCreditTrx: replay.overflowPoolCreditTrx,
+      receiverCount: replay.receiverCount,
+      remainderTrx: replay.remainderTrx,
+      remainderToReceiverTrx: replay.remainderToReceiverTrx,
+      ticketRemainderTrx: replay.ticketRemainderTrx,
+      replayMode: replay.replayMode,
+      recvPoolCount: recvPoolCount,
+      snapshot: replay.snapshot,
+    );
+  }
+
+  Map<String, PoolCycleResult> runAllPools({
+    Map<String, List<RawPoolTx>>? txsByPool,
+    Map<String, List<RawPoolTx>>? purchaseTxsByPool,
+    Map<String, List<RawPoolTx>> exitPoolTxsByPool = const {},
+    Map<String, Map<String, dynamic>>? snapshotsByPool,
+    int? nowMs,
+  }) {
+    final pools = <String, PoolCycleResult>{};
+    for (final cfg in kPoolTiers) {
+      pools[cfg.id] = runPoolCycle(
+        poolId: cfg.id,
+        purchaseTxs: (purchaseTxsByPool ?? txsByPool)?[cfg.id] ?? const [],
+        exitPoolTxs: exitPoolTxsByPool[cfg.id] ?? const [],
+        snapshot: snapshotsByPool?[cfg.id],
+        nowMs: nowMs,
+      );
+    }
+    return pools;
+  }
+
+  // --- helpers ---
+
+  double _round4(double v) => (v * 10000).roundToDouble() / 10000;
+
+  String _dayId(int ms) =>
+      DateTime.fromMillisecondsSinceEpoch(ms, isUtc: true).toIso8601String().substring(0, 10);
+
+  PoolEntry _copyEntry(
+    PoolEntry e, {
+    String? status,
+    double? remainingPoolCreditTrx,
+    double? exitRemainderTrx,
+    double? surplusToTicketTrx,
+    int? recvQueueJoinedAt,
+    int? payDeadlineMs,
+    String? verifiedMainnetTxId,
+    List<PayAssignmentRecord>? payAssignments,
+    String? blockReason,
+    int? completedAt,
+  }) {
+    return PoolEntry(
+      entryId: e.entryId,
+      poolId: e.poolId,
+      payer: e.payer,
+      ticketPaidTrx: e.ticketPaidTrx,
+      poolCreditTrx: e.poolCreditTrx,
+      remainingPoolCreditTrx: remainingPoolCreditTrx ?? e.remainingPoolCreditTrx,
+      exitAmountTrx: e.exitAmountTrx,
+      blockTimestamp: e.blockTimestamp,
+      queueIndex: e.queueIndex,
+      status: status ?? e.status,
+      blockReason: blockReason ?? e.blockReason,
+      completedAt: completedAt ?? e.completedAt,
+      exitRemainderTrx: exitRemainderTrx ?? e.exitRemainderTrx,
+      surplusToTicketTrx: surplusToTicketTrx ?? e.surplusToTicketTrx,
+      recvQueueJoinedAt: recvQueueJoinedAt ?? e.recvQueueJoinedAt,
+      payDeadlineMs: payDeadlineMs ?? e.payDeadlineMs,
+      verifiedMainnetTxId: verifiedMainnetTxId ?? e.verifiedMainnetTxId,
+      payAssignments: payAssignments ?? e.payAssignments,
+    );
+  }
+
+  List<_PayPoolPayer> _selectPayPoolPayers(List<PoolEntry> payQueued, double overflowAmount) {
+    final payers = <_PayPoolPayer>[];
     var sum = 0.0;
-    final candidates = queued.where((e) => !excludeIds.contains(e.entryId)).toList();
-    for (var i = candidates.length - 1; i >= 0 && sum + 0.000001 < overflowAmount; i--) {
-      final e = candidates[i];
-      final credit = _remainingCredit(e);
+    for (var i = payQueued.length - 1; i >= 0 && sum + 0.000001 < overflowAmount; i--) {
+      final e = payQueued[i];
+      final credit = remainingCreditOf(e);
       payers.insert(
         0,
-        _FundingPayer(entryId: e.entryId, payer: e.payer, availableTrx: credit),
+        _PayPoolPayer(entryId: e.entryId, payer: e.payer, availableTrx: credit),
       );
       sum = _round4(sum + credit);
     }
     return payers;
   }
 
-  void _applyConsumption(List<PoolEntry> entries, _SplitResult split) {
-    final map = {for (final e in entries) e.entryId: e};
-
-    for (final recv in split.receivers) {
-      final e = map[recv.entryId];
-      if (e == null) continue;
-      final idx = entries.indexOf(e);
-      if (recv.remainingTrx <= 0.000001) {
-        entries[idx] = PoolEntry(
-          entryId: e.entryId,
-          poolId: e.poolId,
-          payer: e.payer,
-          ticketPaidTrx: e.ticketPaidTrx,
-          poolCreditTrx: e.poolCreditTrx,
-          remainingPoolCreditTrx: 0,
-          exitAmountTrx: e.exitAmountTrx,
-          blockTimestamp: e.blockTimestamp,
-          queueIndex: e.queueIndex,
-          status: 'exit_pending',
-        );
-      } else {
-        entries[idx] = PoolEntry(
-          entryId: e.entryId,
-          poolId: e.poolId,
-          payer: e.payer,
-          ticketPaidTrx: e.ticketPaidTrx,
-          poolCreditTrx: e.poolCreditTrx,
-          remainingPoolCreditTrx: 0,
-          exitAmountTrx: e.exitAmountTrx,
-          blockTimestamp: e.blockTimestamp,
-          queueIndex: e.queueIndex,
-          status: 'exit_partial',
-          exitRemainderTrx: recv.remainingTrx,
-        );
-      }
+  List<SplitAssignment> _buildPayInAssignments(
+    String poolId,
+    List<_PayPoolPayer> payers,
+    String exitPoolAddress,
+    int matchAtMs,
+    String matchDayId,
+  ) {
+    final deadlineMs = matchAtMs + PoolRulesConfig.matchPaymentTimeoutHours * 3600 * 1000;
+    final out = <SplitAssignment>[];
+    for (final p in payers) {
+      if (p.availableTrx <= 0.000001) continue;
+      out.add(SplitAssignment(
+        assignmentId: 'pay_${matchDayId}_${p.entryId}',
+        poolId: poolId,
+        channel: payInChannel,
+        payer: p.payer,
+        payerEntryId: p.entryId,
+        collectorAddress: exitPoolAddress,
+        amountTrx: _round4(p.availableTrx),
+        matchDayId: matchDayId,
+        matchAtMs: matchAtMs,
+        deadlineMs: deadlineMs,
+        purpose: 'pay_pool_to_exit',
+      ));
     }
-
-    for (final payer in split.payers) {
-      final e = map[payer.entryId];
-      if (e == null) continue;
-      final idx = entries.indexOf(e);
-      entries[idx] = PoolEntry(
-        entryId: e.entryId,
-        poolId: e.poolId,
-        payer: e.payer,
-        ticketPaidTrx: e.ticketPaidTrx,
-        poolCreditTrx: e.poolCreditTrx,
-        remainingPoolCreditTrx: 0,
-        exitAmountTrx: e.exitAmountTrx,
-        blockTimestamp: e.blockTimestamp,
-        queueIndex: e.queueIndex,
-        status: 'consumed',
-        surplusToTicketTrx: payer.availableTrx > 0.000001 ? payer.availableTrx : null,
-      );
-    }
+    return out;
   }
 
-  List<TicketSurplusAssignment> _buildTicketRemainder(
+  _RecvPhaseResult _buildRecvPhase(
     String poolId,
-    double remainder,
-    List<_FundingPayer> payers,
+    List<PoolEntry> entries,
+    double overflow,
+    double exitAmount,
+    String exitPoolAddress,
+    String matchDayId,
+    int matchAtMs,
+  ) {
+    final partialEntries = entries.where((e) => e.status == 'recv_partial').toList()
+      ..sort((a, b) => (a.recvQueueJoinedAt ?? 0).compareTo(b.recvQueueJoinedAt ?? 0));
+
+    final partialNeed =
+        partialEntries.fold(0.0, (s, e) => s + (e.exitRemainderTrx ?? exitAmount));
+    final overflowForNew = _round4((overflow - partialNeed).clamp(0, double.infinity));
+    final fullNewCount = (overflowForNew / exitAmount).floor();
+    final remainderTrx = _round4(overflowForNew - fullNewCount * exitAmount);
+
+    final recvQueued = _recvPoolOrder(entries).where((e) => e.status == 'recv_queued').toList();
+    final partialIds = partialEntries.map((e) => e.entryId).toSet();
+    final newCandidates = recvQueued.where((e) => !partialIds.contains(e.entryId)).toList();
+    final fullNewEntries = newCandidates.take(fullNewCount).toList();
+    final partialNewEntries = remainderTrx > 0.000001 && newCandidates.length > fullNewCount
+        ? [newCandidates[fullNewCount]]
+        : <PoolEntry>[];
+
+    final ticketRemainderTrx =
+        remainderTrx > 0.000001 && partialNewEntries.isEmpty ? remainderTrx : 0.0;
+
+    final receivers = <_ReceiverSlot>[];
+    for (var i = 0; i < partialEntries.length; i++) {
+      final e = partialEntries[i];
+      receivers.add(_ReceiverSlot(
+        entryId: e.entryId,
+        beneficiary: e.payer,
+        needTrx: e.exitRemainderTrx ?? exitAmount,
+        isPartialCarryover: true,
+        queueIndex: i + 1,
+      ));
+    }
+    for (var i = 0; i < fullNewEntries.length; i++) {
+      final e = fullNewEntries[i];
+      receivers.add(_ReceiverSlot(
+        entryId: e.entryId,
+        beneficiary: e.payer,
+        needTrx: exitAmount,
+        queueIndex: partialEntries.length + i + 1,
+      ));
+    }
+    for (var i = 0; i < partialNewEntries.length; i++) {
+      final e = partialNewEntries[i];
+      receivers.add(_ReceiverSlot(
+        entryId: e.entryId,
+        beneficiary: e.payer,
+        needTrx: exitAmount,
+        queueIndex: partialEntries.length + fullNewEntries.length + i + 1,
+        isRemainderSlot: true,
+        remainderBudgetTrx: remainderTrx,
+      ));
+    }
+
+    final assignments = receivers
+        .map((recv) => SplitAssignment(
+              assignmentId: 'recv_${matchDayId}_${recv.entryId}',
+              poolId: poolId,
+              channel: recvOutChannel,
+              payer: '',
+              beneficiary: recv.beneficiary,
+              payerEntryId: recv.entryId,
+              collectorAddress: exitPoolAddress,
+              amountTrx: _round4(recv.needTrx),
+              exitAmountTrx: exitAmount,
+              matchDayId: matchDayId,
+              matchAtMs: matchAtMs,
+            ))
+        .toList();
+
+    return _RecvPhaseResult(
+      receivers: receivers,
+      assignments: assignments,
+      receiverCount: receivers.length,
+      remainderTrx: remainderTrx,
+      remainderToReceiverTrx: partialNewEntries.isNotEmpty ? remainderTrx : 0,
+      ticketRemainderTrx: ticketRemainderTrx,
+    );
+  }
+
+  List<TicketSurplusAssignment> _buildTicketRemainderAssignments(
+    String poolId,
+    double ticketRemainderTrx,
+    List<_PayPoolPayer> payers,
     String purchaseAddress,
     String matchDayId,
   ) {
-    if (remainder <= 0.000001) return [];
+    if (ticketRemainderTrx <= 0.000001) return const [];
     final out = <TicketSurplusAssignment>[];
-    var left = remainder;
+    var left = ticketRemainderTrx;
     for (final payer in payers) {
       if (left <= 0.000001) break;
       final chunk = payer.availableTrx < left ? payer.availableTrx : left;
@@ -387,200 +823,40 @@ class PoolEngineService {
         amountTrx: _round4(chunk),
         matchDayId: matchDayId,
       ));
-      payer.availableTrx = _round4(payer.availableTrx - chunk);
       left = _round4(left - chunk);
     }
     return out;
   }
 
-  PoolCycleResult runPoolCycle({
-    required String poolId,
-    required List<RawPoolTx> txs,
-    List<PoolExitAnchor> anchors = const [],
-    int? nowMs,
-  }) {
-    final wallNow = nowMs ?? DateTime.now().millisecondsSinceEpoch;
-    final cfg = kPoolTiers.firstWhere((t) => t.id == poolId);
-    final wallDt = DateTime.fromMillisecondsSinceEpoch(wallNow, isUtc: true);
-    final cutoff = PoolRulesConfig.checkpointCutoffMs(wallDt);
-    final matchCtx = PoolRulesConfig.dailyMatchContext(wallDt);
-    final sorted = _sortTxs(txs.where((t) => t.blockTimestamp <= cutoff).toList());
-
-    final stateMap = <String, PoolEntry>{};
-    final matchDays = <_MatchDaySummary>[];
-
-    if (sorted.isNotEmpty) {
-      final firstTs = sorted.map((t) => t.blockTimestamp).reduce((a, b) => a < b ? a : b);
-      final firstMatchDay = _utcDayMs(firstTs + PoolRulesConfig.entryPeriodDays * _msDay);
-      final endDay = _utcDayMs(cutoff);
-
-      for (var dayMs = firstMatchDay; dayMs < endDay; dayMs += _msDay) {
-        final r = _runDayMatch(poolId, sorted, anchors, stateMap, dayMs, matchDays);
-        if (r != null) matchDays.add(r.summary);
-      }
-
-      final today = _runDayMatch(poolId, sorted, anchors, stateMap, endDay, matchDays);
-      if (today != null) matchDays.add(today.summary);
-
-      final entries = _mergeAtCutoff(poolId, sorted, stateMap, anchors);
-      final fill = poolFillState(poolId, entries, cutoff, matchDays);
-
-      return PoolCycleResult(
-        poolId: poolId,
-        checkpointCutoffMs: cutoff,
-        fill: fill,
-        entries: entries,
-        assignments: today?.split.assignments ?? const [],
-        ticketSurplusAssignments: today?.split.ticketSurplusAssignments ?? const [],
-        collectorMode: today?.split.collectorMode ?? 'none',
-        purchaseAddress: cfg.purchaseAddress,
-        matchDayId: matchCtx.matchDayId,
-        matchAtMs: matchCtx.matchAtMs,
-        nextMatchAtMs: matchCtx.nextMatchAtMs,
-        matchedCreditTrx: today?.split.matchedCreditTrx ?? 0,
-        overflowPoolCreditTrx: today?.split.overflowPoolCreditTrx ?? 0,
-        receiverCount: today?.split.receiverCount ?? 0,
-        remainderTrx: today?.split.remainderTrx ?? 0,
-        remainderToReceiverTrx: today?.split.remainderToReceiverTrx ?? 0,
-        ticketRemainderTrx: today?.split.ticketRemainderTrx ?? 0,
-      );
-    }
-
-    return PoolCycleResult(
-      poolId: poolId,
-      checkpointCutoffMs: cutoff,
-      fill: poolFillState(poolId, const [], cutoff),
-      entries: const [],
-      assignments: const [],
-      collectorMode: 'none',
-      purchaseAddress: cfg.purchaseAddress,
-      matchDayId: matchCtx.matchDayId,
-      matchAtMs: matchCtx.matchAtMs,
-      nextMatchAtMs: matchCtx.nextMatchAtMs,
-    );
-  }
-
-  _DayMatchResult? _runDayMatch(
-    String poolId,
-    List<RawPoolTx> sorted,
-    List<PoolExitAnchor> anchors,
-    Map<String, PoolEntry> stateMap,
-    int dayCutoff,
-    List<_MatchDaySummary> priorMatchDays,
-  ) {
-    final dayTxs = sorted.where((t) => t.blockTimestamp <= dayCutoff).toList();
-    var entries = _mergeAtCutoff(poolId, dayTxs, stateMap, anchors);
-    final split = _buildSplitInternal(poolId, entries, anchors, dayCutoff, priorMatchDays);
-    if (split.assignments.isEmpty && split.ticketSurplusAssignments.isEmpty) return null;
-
-    _applyConsumption(entries, split);
-    final matchDayId = DateTime.fromMillisecondsSinceEpoch(dayCutoff, isUtc: true)
-        .toIso8601String()
-        .substring(0, 10);
-    for (final e in entries) {
-      stateMap[e.entryId] = e;
-    }
-
-    return _DayMatchResult(
-      split: split,
-      summary: _MatchDaySummary(
-        matchDayId: matchDayId,
-        matchedCreditTrx: split.matchedCreditTrx,
-        remainingPoolCreditTrx: poolFillState(poolId, entries, dayCutoff, [
-          ...priorMatchDays,
-          _MatchDaySummary(matchDayId: matchDayId, matchedCreditTrx: split.matchedCreditTrx, remainingPoolCreditTrx: 0),
-        ]).totalPoolCreditTrx,
-      ),
-    );
-  }
-
-  List<PoolEntry> _mergeAtCutoff(
-    String poolId,
-    List<RawPoolTx> txs,
-    Map<String, PoolEntry> stateMap,
-    List<PoolExitAnchor> anchors,
-  ) {
-    final fresh = buildEntries(poolId, txs);
-    final merged = fresh.map((e) {
-      final prev = stateMap[e.entryId];
-      if (prev == null) return e;
-      return PoolEntry(
-        entryId: e.entryId,
-        poolId: e.poolId,
-        payer: e.payer,
-        ticketPaidTrx: e.ticketPaidTrx,
-        poolCreditTrx: e.poolCreditTrx,
-        remainingPoolCreditTrx: prev.remainingPoolCreditTrx,
-        exitAmountTrx: e.exitAmountTrx,
-        blockTimestamp: e.blockTimestamp,
-        queueIndex: e.queueIndex,
-        status: prev.status,
-        blockReason: prev.blockReason,
-        completedAt: prev.completedAt,
-        exitRemainderTrx: prev.exitRemainderTrx,
-        surplusToTicketTrx: prev.surplusToTicketTrx,
-      );
-    }).toList();
-    return applyLifecycle(merged, anchors);
-  }
-
-  Map<String, PoolCycleResult> runAllPools({
-    required Map<String, List<RawPoolTx>> txsByPool,
-    Map<String, List<RawPoolTx>> exitPoolTxsByPool = const {},
-    List<PoolExitAnchor> anchors = const [],
-    int? nowMs,
-  }) {
-    // TODO(v4): 接入 exitPoolTxsByPool + derivePayVerifications，与 pool-rules.js 同步
-    final out = <String, PoolCycleResult>{};
-    for (final tier in kPoolTiers) {
-      out[tier.id] = runPoolCycle(
-        poolId: tier.id,
-        txs: txsByPool[tier.id] ?? [],
-        anchors: anchors.where((a) => a.poolId == null || a.poolId == tier.id).toList(),
-        nowMs: nowMs,
-      );
-    }
-    return out;
-  }
-
-  int _utcDayMs(int tsMs) {
-    final d = DateTime.fromMillisecondsSinceEpoch(tsMs, isUtc: true);
-    return DateTime.utc(d.year, d.month, d.day).millisecondsSinceEpoch;
-  }
-
-  double _round4(double v) => (v * 10000).roundToDouble() / 10000;
-
-  List<RawPoolTx> _sortTxs(List<RawPoolTx> txs) {
-    final copy = [...txs];
-    copy.sort((a, b) {
-      final bn = (a.blockNumber ?? 0) - (b.blockNumber ?? 0);
-      if (bn != 0) return bn;
-      final bt = a.blockTimestamp - b.blockTimestamp;
-      if (bt != 0) return bt;
-      return a.txHash.compareTo(b.txHash);
+  List<PoolEntry> _recvPoolOrder(List<PoolEntry> entries) {
+    final list = entries.where((e) => e.status == 'recv_queued' || e.status == 'recv_partial').toList();
+    list.sort((a, b) {
+      final ta = a.recvQueueJoinedAt ?? a.blockTimestamp;
+      final tb = b.recvQueueJoinedAt ?? b.blockTimestamp;
+      if (ta != tb) return ta.compareTo(tb);
+      return a.queueIndex.compareTo(b.queueIndex);
     });
-    return copy;
+    return list;
   }
 }
 
-class _ReceiverSlot {
-  _ReceiverSlot({
-    required this.slotId,
-    required this.entryId,
-    required this.beneficiary,
-    required this.collectorAddress,
-    required this.remainingTrx,
-  });
+class _ReplayCtx {
+  _ReplayCtx({
+    this.incrementalFromMs = 0,
+    Set<String>? blockedPayers,
+    Set<String>? usedExitTxIds,
+    this.lastQueueIndex = 0,
+  })  : blockedPayers = blockedPayers ?? {},
+        usedExitTxIds = usedExitTxIds ?? {};
 
-  final String slotId;
-  final String entryId;
-  final String beneficiary;
-  final String collectorAddress;
-  double remainingTrx;
+  int incrementalFromMs;
+  Set<String> blockedPayers;
+  Set<String> usedExitTxIds;
+  int lastQueueIndex;
 }
 
-class _FundingPayer {
-  _FundingPayer({
+class _PayPoolPayer {
+  const _PayPoolPayer({
     required this.entryId,
     required this.payer,
     required this.availableTrx,
@@ -588,19 +864,105 @@ class _FundingPayer {
 
   final String entryId;
   final String payer;
-  double availableTrx;
-  int splitCount = 0;
+  final double availableTrx;
 }
 
-class _SplitResult {
-  _SplitResult({
+class _ReceiverSlot {
+  const _ReceiverSlot({
+    required this.entryId,
+    required this.beneficiary,
+    required this.needTrx,
+    this.queueIndex = 0,
+    this.isPartialCarryover = false,
+    this.isRemainderSlot = false,
+    this.remainderBudgetTrx,
+  });
+
+  final String entryId;
+  final String beneficiary;
+  final double needTrx;
+  final int queueIndex;
+  final bool isPartialCarryover;
+  final bool isRemainderSlot;
+  final double? remainderBudgetTrx;
+}
+
+class _RecvPhaseResult {
+  const _RecvPhaseResult({
+    required this.receivers,
+    required this.assignments,
+    required this.receiverCount,
+    required this.remainderTrx,
+    required this.remainderToReceiverTrx,
+    required this.ticketRemainderTrx,
+  });
+
+  final List<_ReceiverSlot> receivers;
+  final List<SplitAssignment> assignments;
+  final int receiverCount;
+  final double remainderTrx;
+  final double remainderToReceiverTrx;
+  final double ticketRemainderTrx;
+}
+
+class _DayMatchResult {
+  const _DayMatchResult({
     required this.fill,
-    this.receivers = const [],
-    this.payers = const [],
-    this.assignments = const [],
+    required this.exitPoolAddress,
+    required this.purchaseAddress,
+    required this.overflowPoolCreditTrx,
+    this.payAssignments = const [],
+    this.recvPhase,
     this.ticketSurplusAssignments = const [],
     this.matchedCreditTrx = 0,
-    this.collectorMode = 'none',
+  });
+
+  final PoolFillState fill;
+  final List<SplitAssignment> payAssignments;
+  final _RecvPhaseResult? recvPhase;
+  final List<TicketSurplusAssignment> ticketSurplusAssignments;
+  final double matchedCreditTrx;
+  final double overflowPoolCreditTrx;
+  final String exitPoolAddress;
+  final String purchaseAddress;
+
+  List<SplitAssignment> get recvAssignments => recvPhase?.assignments ?? const [];
+}
+
+class _RunDayResult {
+  const _RunDayResult({
+    required this.entries,
+    required this.split,
+    required this.summary,
+  });
+
+  final List<PoolEntry> entries;
+  final _DayMatchResult split;
+  final MatchDaySummary summary;
+}
+
+class _VerifyResult {
+  const _VerifyResult({
+    required this.entries,
+    required this.usedExitTxIds,
+  });
+
+  final List<PoolEntry> entries;
+  final Set<String> usedExitTxIds;
+}
+
+class _ReplayResult {
+  const _ReplayResult({
+    required this.entries,
+    required this.fill,
+    required this.exitPoolAddress,
+    required this.purchaseAddress,
+    required this.snapshot,
+    required this.replayMode,
+    this.payAssignments = const [],
+    this.recvAssignments = const [],
+    this.ticketSurplusAssignments = const [],
+    this.matchedCreditTrx = 0,
     this.overflowPoolCreditTrx = 0,
     this.receiverCount = 0,
     this.remainderTrx = 0,
@@ -608,64 +970,19 @@ class _SplitResult {
     this.ticketRemainderTrx = 0,
   });
 
+  final List<PoolEntry> entries;
   final PoolFillState fill;
-  final List<_ReceiverSlot> receivers;
-  final List<_FundingPayer> payers;
-  final List<SplitAssignment> assignments;
+  final List<SplitAssignment> payAssignments;
+  final List<SplitAssignment> recvAssignments;
   final List<TicketSurplusAssignment> ticketSurplusAssignments;
   final double matchedCreditTrx;
-  final String collectorMode;
   final double overflowPoolCreditTrx;
   final int receiverCount;
   final double remainderTrx;
   final double remainderToReceiverTrx;
   final double ticketRemainderTrx;
-}
-
-class _MatchDaySummary {
-  const _MatchDaySummary({
-    required this.matchDayId,
-    required this.matchedCreditTrx,
-    required this.remainingPoolCreditTrx,
-  });
-
-  final String matchDayId;
-  final double matchedCreditTrx;
-  final double remainingPoolCreditTrx;
-}
-
-class _DayMatchResult {
-  const _DayMatchResult({
-    required this.split,
-    required this.summary,
-  });
-
-  final _SplitResult split;
-  final _MatchDaySummary summary;
-}
-
-class RawPoolTx {
-  const RawPoolTx({
-    required this.txHash,
-    required this.fromAddress,
-    required this.amount,
-    required this.blockTimestamp,
-    this.toAddress,
-    this.blockNumber,
-  });
-
-  final String txHash;
-  final String fromAddress;
-  final String? toAddress;
-  final double amount;
-  final int blockTimestamp;
-  final int? blockNumber;
-}
-
-extension _FirstOrNull<E> on Iterable<E> {
-  E? get firstOrNull {
-    final it = iterator;
-    if (it.moveNext()) return it.current;
-    return null;
-  }
+  final String exitPoolAddress;
+  final String purchaseAddress;
+  final Map<String, dynamic> snapshot;
+  final String replayMode;
 }

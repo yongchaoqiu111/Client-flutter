@@ -4,9 +4,11 @@ import 'package:http/http.dart' as http;
 
 import '../config/pool_rules_config.dart';
 import '../models/pool_cycle_models.dart';
-import 'pool_engine_service.dart' show PoolEngineService, RawPoolTx;
+import '../utils/tron_address_util.dart';
+import 'pool_engine_service.dart';
+import 'pool_snapshot_store.dart';
 
-/// 方案 A：TronGrid 拉买券 + 出场池入账，本地排单引擎（v4 引擎 JS 为准，Dart 同步中）
+/// 方案 A：TronGrid 拉买券 + 出场池入账，本地 pool-v4 双池引擎
 class PoolMatcherService {
   PoolMatcherService({this.tronGridApiKey});
 
@@ -62,8 +64,8 @@ class PoolMatcherService {
         }
         out.add(RawPoolTx(
           txHash: txHash,
-          fromAddress: fromAddress,
-          toAddress: toAddress,
+          fromAddress: TronAddressUtil.normalize(fromAddress),
+          toAddress: toAddress != null ? TronAddressUtil.normalize(toAddress) : null,
           amount: amountSun / 1e6,
           blockTimestamp: blockTimestamp,
           blockNumber: tx['blockNumber'] as int?,
@@ -79,7 +81,6 @@ class PoolMatcherService {
         .toList();
   }
 
-  /// 出场池入账（非买券金额）
   List<RawPoolTx> parseExitPoolTxs(List<dynamic> txs, double ticketPriceTrx) {
     return parseTransferTxs(txs)
         .where((t) => (t.amount - ticketPriceTrx).abs() > 0.000001)
@@ -89,8 +90,12 @@ class PoolMatcherService {
   Future<Map<String, PoolCycleResult>> runFullMatcher({int? nowMs}) async {
     final purchaseByPool = <String, List<RawPoolTx>>{};
     final exitByPool = <String, List<RawPoolTx>>{};
+    final snapshotsByPool = <String, Map<String, dynamic>>{};
 
     for (final tier in kPoolTiers) {
+      final snap = await PoolSnapshotStore.load(tier.id);
+      if (snap != null) snapshotsByPool[tier.id] = snap;
+
       final purchaseRaw = await fetchAccountTransactions(tier.purchaseAddress);
       purchaseByPool[tier.id] = parseEntryTxs(purchaseRaw, tier.id, tier.ticketPriceTrx);
 
@@ -103,11 +108,18 @@ class PoolMatcherService {
       }
     }
 
-    return _engine.runAllPools(
-      txsByPool: purchaseByPool,
+    final pools = _engine.runAllPools(
+      purchaseTxsByPool: purchaseByPool,
       exitPoolTxsByPool: exitByPool,
+      snapshotsByPool: snapshotsByPool.isEmpty ? null : snapshotsByPool,
       nowMs: nowMs,
     );
+
+    for (final entry in pools.entries) {
+      await PoolSnapshotStore.save(entry.key, entry.value.snapshot);
+    }
+
+    return pools;
   }
 
   List<SplitAssignment> assignmentsForUser(
@@ -117,7 +129,10 @@ class PoolMatcherService {
     final out = <SplitAssignment>[];
     for (final p in pools.values) {
       for (final a in p.assignments) {
-        if (a.payer == userAddress || a.beneficiary == userAddress) out.add(a);
+        if (TronAddressUtil.equal(a.payer, userAddress) ||
+            TronAddressUtil.equal(a.beneficiary, userAddress)) {
+          out.add(a);
+        }
       }
     }
     return out;

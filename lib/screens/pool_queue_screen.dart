@@ -13,6 +13,7 @@ import '../models/pool_cycle_models.dart';
 import '../providers/app_state.dart';
 
 import '../services/pool_matcher_service.dart';
+import '../utils/tron_address_util.dart';
 
 
 
@@ -149,15 +150,10 @@ class _PoolQueueScreenState extends State<PoolQueueScreen> {
             const SizedBox(height: 24),
 
             const Text(
-
-              '规则：向买券地址付 ticketPrice（如 100 TRX）→ 计 poolCredit（如 3000）入池；'
-
-              '每日 08:00 匹配；池满 30 万为核心，仅匹配超出部分；'
-
-              '超出部分按整数 3900 给收款区，零头打排单券地址。',
-
+              '规则 v4：买券 → 打款池排队；池满 30 万且满 15 天后，每日 08:00 将溢出额度'
+              '生成 pay_in 任务付至出场池；主网验款通过 → 收款池；收款池按 3900 整数 recv_out，'
+              '零头 recv_partial 或打排单券地址。点「刷新链上状态」仅查 TronGrid，无需自报 anchor。',
               style: TextStyle(fontSize: 11, color: Colors.white54, height: 1.4),
-
             ),
 
           ],
@@ -242,6 +238,7 @@ class _PoolQueueScreenState extends State<PoolQueueScreen> {
             const SizedBox(height: 8),
 
             SelectableText('买券地址：${tier.purchaseAddress}', style: const TextStyle(fontSize: 11)),
+            SelectableText('出场池地址：${tier.exitPoolAddress}', style: const TextStyle(fontSize: 11, color: Colors.cyan)),
 
             if (fill != null) ...[
 
@@ -271,10 +268,11 @@ class _PoolQueueScreenState extends State<PoolQueueScreen> {
                   '历史已匹配消耗 ${fill.consumedPoolCreditTrx!.toStringAsFixed(0)} · 剩余 ${fill.totalPoolCreditTrx.toStringAsFixed(0)}',
                   style: const TextStyle(fontSize: 11, color: Colors.white54),
                 ),
-              if (result!.assignments.isNotEmpty)
+              if (result!.payAssignments.isNotEmpty || result.recvAssignments.isNotEmpty)
                 Text(
                   '本日溢出 ${result.overflowPoolCreditTrx.toStringAsFixed(0)} → '
-                  '${result.receiverCount} 人收 3900 · 打款 ${result.assignments.length} 笔',
+                  'pay_in ${result.payAssignments.length} 笔 · recv_out ${result.recvAssignments.length} 笔 · '
+                  '收款池 ${result.recvPoolCount} 人',
                   style: const TextStyle(fontSize: 11, color: Colors.cyan),
                 ),
               if (result.remainderToReceiverTrx > 0)
@@ -347,14 +345,16 @@ class _PoolQueueScreenState extends State<PoolQueueScreen> {
 
     for (final p in _pools!.values) {
       for (final e in p.entries) {
-        if (e.payer == me && e.status != 'blocked') myEntry = e;
+        if (TronAddressUtil.equal(e.payer, me) && e.status != 'blocked') myEntry = e;
       }
-      for (final a in p.assignments) {
-        if (a.payer == me) myPay.add(a);
-        if (a.beneficiary == me) myRecv.add(a);
+      for (final a in p.payAssignments) {
+        if (TronAddressUtil.equal(a.payer, me)) myPay.add(a);
+      }
+      for (final a in p.recvAssignments) {
+        if (TronAddressUtil.equal(a.beneficiary, me)) myRecv.add(a);
       }
       for (final t in p.ticketSurplusAssignments) {
-        if (t.payer == me) myTicketSurplus.add(t);
+        if (TronAddressUtil.equal(t.payer, me)) myTicketSurplus.add(t);
       }
       if (myEntry != null || myPay.isNotEmpty || myRecv.isNotEmpty || myTicketSurplus.isNotEmpty) {
         mine = p;
@@ -399,8 +399,10 @@ class _PoolQueueScreenState extends State<PoolQueueScreen> {
             const Text('我的排单', style: TextStyle(fontWeight: FontWeight.w600)),
 
             if (myEntry != null)
-
-              Text('状态：${myEntry.status} · 队列 #${myEntry.queueIndex}', style: const TextStyle(fontSize: 12)),
+              Text(
+                '状态：${_statusLabel(myEntry.status)} · 队列 #${myEntry.queueIndex}',
+                style: const TextStyle(fontSize: 12),
+              ),
 
             if (myRecv.isNotEmpty) ...[
 
@@ -422,32 +424,20 @@ class _PoolQueueScreenState extends State<PoolQueueScreen> {
 
               const SizedBox(height: 8),
 
-              Text('我的打款单（最多 ${PoolRulesConfig.maxSplitsPerPayer} 笔）', style: const TextStyle(fontWeight: FontWeight.w500)),
-
+              const Text('我的出场打款（pay_in → 出场池）', style: TextStyle(fontWeight: FontWeight.w500)),
               ...myPay.map((a) => Padding(
-
                     padding: const EdgeInsets.only(top: 6),
-
                     child: Column(
-
                       crossAxisAlignment: CrossAxisAlignment.start,
-
                       children: [
-
                         Text(
-
-                          '#${a.splitIndex} → ${a.beneficiary.substring(0, 6)}… 收 ${a.amountTrx.toStringAsFixed(0)} TRX',
-
+                          '付 ${a.amountTrx.toStringAsFixed(0)} TRX 至出场池'
+                          '${a.deadlineMs > 0 ? ' · 截止 ${_fmtDeadline(a.deadlineMs)}' : ''}',
                           style: const TextStyle(fontSize: 12),
-
                         ),
-
-                        SelectableText('收款地址：${a.collectorAddress}', style: const TextStyle(fontSize: 11)),
-
+                        SelectableText('出场池：${a.collectorAddress}', style: const TextStyle(fontSize: 11)),
                       ],
-
                     ),
-
                   )),
 
               const SizedBox(height: 8),
@@ -491,6 +481,26 @@ class _PoolQueueScreenState extends State<PoolQueueScreen> {
 
     );
 
+  }
+
+  static String _statusLabel(String status) {
+    const labels = {
+      'pay_queued': '打款池排队',
+      'pay_pending': '待付出场池',
+      'pay_expired': '出场打款超时',
+      'recv_queued': '收款池排队',
+      'recv_partial': '收款零头待凑满',
+      'recv_pending': '待收出场款',
+      'done': '已完成',
+      'blocked': '已屏蔽',
+      'consumed': '已消耗',
+    };
+    return labels[status] ?? status;
+  }
+
+  static String _fmtDeadline(int ms) {
+    final d = DateTime.fromMillisecondsSinceEpoch(ms, isUtc: true).toLocal();
+    return '${d.month}/${d.day} ${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
   }
 
 }
