@@ -1,6 +1,7 @@
 # 无服务器排单算法 · pool-v4-dual-pool（中文版）
 
 > **规则版本**：`pool-v4-dual-pool`  
+> **开发总览（推荐入口）**：[pool-v4-dev-master-zh.md](./pool-v4-dev-master-zh.md) — 文档地图、4 档参数、匹配算法摘要、源码位置  
 > **参考实现（本仓库）**：[`lib/services/pool_engine_service.dart`](../lib/services/pool_engine_service.dart)、[`lib/config/pool_rules_config.dart`](../lib/config/pool_rules_config.dart)、[`lib/services/exit_pay_verify.dart`](../lib/services/exit_pay_verify.dart)  
 > **英文版**：[pool-v4-algorithm-en.md](./pool-v4-algorithm-en.md)  
 > **官方发展沙盘（最稳路线）**：[stable-growth-roadmap-zh.md](./stable-growth-roadmap-zh.md)  

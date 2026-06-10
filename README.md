@@ -45,8 +45,9 @@ flutter run                # 已连接手机
 
 | 文档 | 说明 |
 |------|------|
-| [docs/pool-v4-algorithm-zh.md](docs/pool-v4-algorithm-zh.md) | 算法中文版 |
-| [docs/pool-snapshot-phase2-upgrade-zh.md](docs/pool-snapshot-phase2-upgrade-zh.md) | **一期→二期 WSS 升级指南** |
+| [docs/pool-v4-dev-master-zh.md](docs/pool-v4-dev-master-zh.md) | **开发总览（档位 + 匹配算法 + 源码索引）** |
+| [docs/pool-v4-algorithm-zh.md](docs/pool-v4-algorithm-zh.md) | 算法完整说明 |
+| [docs/pool-snapshot-phase2-upgrade-zh.md](docs/pool-snapshot-phase2-upgrade-zh.md) | 一期→二期 WSS 升级 |
 | [docs/pool-snapshot-server-zh.md](docs/pool-snapshot-server-zh.md) | 快照服务器设计 |
 
 **快照仓（算法 + 每日 JSON）**：[yongchaoqiu111/js](https://github.com/yongchaoqiu111/js) → Vercel CDN
